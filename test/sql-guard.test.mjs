@@ -6,7 +6,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 const BIN = path.resolve(import.meta.dirname, "..", "bin", "format-staged.mjs");
-const NM = "/Users/starlight/code/orlidating/repos/compatibility/node_modules";
+// This package's own node_modules. The formatters are devDependencies here so
+// the tests run anywhere — an earlier version borrowed a sibling repo's
+// node_modules by absolute path, which passed locally for the wrong reason
+// (the SQL branch was silently skipped) and could not run on CI at all.
+const NM = path.resolve(import.meta.dirname, "..", "node_modules");
 
 function repoWithSql(sql) {
   const dir = mkdtempSync(path.join(tmpdir(), "sqlguard-"));
@@ -15,7 +19,9 @@ function repoWithSql(sql) {
   execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
   writeFileSync(path.join(dir, ".gitignore"), "node_modules/\n");
   writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "t", version: "1.0.0" }));
-  try { symlinkSync(NM, path.join(dir, "node_modules")); } catch {}
+  // Fail loudly rather than skip: a test that quietly exercises nothing is worse
+  // than no test, and that is exactly how this suite went green while broken.
+  symlinkSync(NM, path.join(dir, "node_modules"));
   mkdirSync(path.join(dir, "supabase", "migrations"), { recursive: true });
   const f = path.join(dir, "supabase", "migrations", "0010_t.sql");
   writeFileSync(f, sql);
@@ -32,19 +38,35 @@ function run(dir) {
 }
 
 test("an apostrophe in a comment does not desynchronise literal parsing", () => {
-  // The exact shape that broke backend#75: English prose with a possessive.
+  // Regression test for the real failure in backend#75. The shape matters: an
+  // apostrophe in prose, then SEVERAL literals whose spacing the formatter will
+  // change. A single literal is not enough — the desync has to produce a
+  // different pairing in the input and the output for gate 2 to notice, which is
+  // exactly why an earlier version of this test passed against a broken scanner.
   const sql = [
-    "-- Telling those roles apart is the policies' job, not the grant's.",
-    "create   function private.f () returns boolean language sql",
-    "security definer set search_path = '' as $$ select true $$;",
+    // Exactly ONE apostrophe. An even number pairs with itself and stays in
+    // sync, which is how a weaker version of this test passed against a broken
+    // scanner; an odd one borrows the next real literal's opening quote.
+    "-- Telling those roles apart is the policies' job.",
+    "revoke  all  on  public.consents  from  anon,  authenticated;",
+    "grant   select,  insert  on  public.consents  to  authenticated;",
+    "create   policy  consents_select  on  public.consents",
+    "  for  select  to  authenticated  using  (  user_id  =  auth.uid()  );",
+    "create   function  private.is_admin ()  returns  boolean",
+    "  language  sql  security  definer  set  search_path  =  ''",
+    "  as  $$  select  current_setting('app.role',  true)  =  'admin'  $$;",
     "",
   ].join("\n");
   const { dir, f } = repoWithSql(sql);
   const { out } = run(dir);
   assert.doesNotMatch(out, /altered a string literal/);
   assert.doesNotMatch(out, /continued across a newline/);
-  // and it actually reformatted, rather than passing by refusing
-  assert.notEqual(readFileSync(f, "utf8"), sql);
+  const after = readFileSync(f, "utf8");
+  assert.notEqual(after, sql, "expected the file to be reformatted, not skipped");
+  // The literals themselves must be untouched — that is the property gate 2 exists for.
+  for (const lit of ["'app.role'", "'admin'", "''"]) {
+    assert.ok(after.includes(lit), `literal ${lit} did not survive formatting`);
+  }
   rmSync(dir, { recursive: true, force: true });
 });
 
