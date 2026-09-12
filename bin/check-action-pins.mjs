@@ -22,12 +22,17 @@
  * Usage:
  *   node check-action-pins.mjs            # check, exit 1 on any violation
  *   node check-action-pins.mjs --list     # print every action ref and its state
+ *   node check-action-pins.mjs --require  # also fail when there is nothing to check
  */
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 
 const LIST = process.argv.includes("--list");
+// A check that reports success without checking anything is the failure shape
+// this tool exists to eliminate. --require turns "nothing found" into a failure,
+// for repos that know they have workflows and want a mis-glob to be loud.
+const REQUIRE = process.argv.includes("--require");
 
 const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
   encoding: "utf8",
@@ -147,6 +152,20 @@ if (LIST) {
 
 if (violations.length === 0) {
   const n = listed.length;
+  if (n === 0) {
+    // Say what actually happened. "OK — 0 references, all pinned" reads like a
+    // check that ran and passed; this one found nothing to inspect.
+    const msg = "No GitHub Action references found — nothing was checked.";
+    if (REQUIRE) {
+      console.error(`✗ ${msg}`);
+      console.error("  --require was passed, so this is a failure: either the workflows");
+      console.error("  are missing or they are not where this expected to find them");
+      console.error("  (.github/workflows/*.y[a]ml, .github/actions/*/action.y[a]ml).");
+      process.exit(1);
+    }
+    console.log(msg);
+    process.exit(0);
+  }
   console.log(`OK — ${n} action reference${n === 1 ? "" : "s"}, all pinned to an immutable ref.`);
   process.exit(0);
 }

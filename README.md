@@ -67,6 +67,14 @@ Checks `.github/workflows/*.y(a)ml` and any composite action under
 | `docker://img@sha256:...` | pass |
 | `docker://img:tag` | **fail** |
 
+### It says when it checked nothing
+
+A repository with no workflows prints `No GitHub Action references found — nothing
+was checked.` and exits 0, rather than `OK — 0 references, all pinned`. The second
+phrasing reads like a check that ran and passed, which is the failure shape this
+tool exists to eliminate. Pass `--require` to turn that into a failure — worth it
+in a repo that knows it has workflows, so a mis-glob is loud rather than green.
+
 Resolve a SHA with:
 
 ```sh

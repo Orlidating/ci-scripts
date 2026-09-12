@@ -120,3 +120,40 @@ test("is not fooled by a quoted ref", () => {
   assert.equal(run(dir).code, 1);
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("says nothing was checked, rather than OK, when there are no workflows", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pins-"));
+  execFileSync("git", ["init", "-q", dir]);
+  const { code, out } = run(dir);
+  assert.equal(code, 0);
+  assert.match(out, /nothing was checked/);
+  assert.doesNotMatch(out, /all pinned/); // must not read like a check that passed
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("--require turns 'nothing to check' into a failure", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pins-"));
+  execFileSync("git", ["init", "-q", dir]);
+  let code = 0;
+  try {
+    execFileSync("node", [BIN, "--require"], { cwd: dir, encoding: "utf8" });
+  } catch (err) {
+    code = err.status;
+  }
+  assert.equal(code, 1);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("--require still passes when real pinned references exist", () => {
+  const dir = repoWith(wf(`actions/checkout@${SHA} # v5.1.0`));
+  const code = (() => {
+    try {
+      execFileSync("node", [BIN, "--require"], { cwd: dir, encoding: "utf8" });
+      return 0;
+    } catch (err) {
+      return err.status;
+    }
+  })();
+  assert.equal(code, 0);
+  rmSync(dir, { recursive: true, force: true });
+});
