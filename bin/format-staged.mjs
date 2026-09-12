@@ -178,20 +178,113 @@ async function runPrettier(files) {
  * A formatter bug, or a construct we have not thought about, therefore degrades
  * to a refusal instead of a corrupted migration.
  */
-/** `'a'` followed by whitespace containing a newline followed by `'b'`. */
-const SQL_LITERAL_CONTINUATION = /'(?:[^']|'')*'[^\S\n]*\n\s*'/;
-
 /**
- * Literal contents in order: single-quoted (with '' escapes) and dollar-quoted.
- * Whitespace inside these is data, so it must survive formatting untouched.
+ * A minimal left-to-right SQL scanner.
+ *
+ * Regexes cannot do this job, and three successive bugs in this guard came from
+ * pretending otherwise. The decisive one: an apostrophe in an English comment —
+ * `-- telling those roles apart is the policies' job` — has no partner, so it
+ * pairs with the opening quote of the next real literal and desynchronises every
+ * literal after it. A correct migration then looks corrupted. This repo's SQL
+ * comments are prose full of possessives, so that is the common case, not a
+ * corner one.
+ *
+ * Tracks: line comments, block comments (nested, as PostgreSQL allows), quoted
+ * identifiers, dollar-quoted strings, and single-quoted strings including the
+ * E'' and U&'' forms. Returns the literals in order, plus whether any two
+ * adjacent literals are separated only by whitespace/comments containing a
+ * newline — which is string continuation, where collapsing the newline changes
+ * `'foo'\n'bar'` (= foobar) into a syntax error.
  */
-function sqlLiterals(sql) {
-  const out = [];
-  const re = /\$([A-Za-z_][A-Za-z0-9_]*)?\$[\s\S]*?\$\1?\$|'(?:[^']|'')*'/g;
-  let m;
-  while ((m = re.exec(sql)) !== null) out.push(m[0]);
-  return out;
+function scanSql(sql) {
+  const literals = [];
+  let hasContinuation = false;
+  let lastLiteralEnd = -1;
+  let i = 0;
+  const n = sql.length;
+
+  const gapIsContinuation = (from, to) => {
+    if (from < 0) return false;
+    const gap = sql.slice(from, to);
+    if (!gap.includes("\n")) return false;
+    // Whitespace and comments only — anything else means these are separate tokens.
+    return /^(?:\s|--[^\n]*|\/\*[\s\S]*?\*\/)*$/.test(gap);
+  };
+
+  while (i < n) {
+    const c = sql[i];
+    const two = sql.slice(i, i + 2);
+
+    if (two === "--") {
+      const nl = sql.indexOf("\n", i);
+      i = nl === -1 ? n : nl;
+      continue;
+    }
+
+    if (two === "/*") {
+      let depth = 1;
+      i += 2;
+      while (i < n && depth > 0) {
+        if (sql.slice(i, i + 2) === "/*") { depth++; i += 2; continue; }
+        if (sql.slice(i, i + 2) === "*/") { depth--; i += 2; continue; }
+        i++;
+      }
+      continue;
+    }
+
+    if (c === '"') {
+      i++;
+      while (i < n) {
+        if (sql[i] === '"') {
+          if (sql[i + 1] === '"') { i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    // Dollar-quoted: $tag$ ... $tag$
+    const dollar = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i));
+    if (dollar) {
+      const tag = dollar[0];
+      const close = sql.indexOf(tag, i + tag.length);
+      const stop = close === -1 ? n : close + tag.length;
+      if (gapIsContinuation(lastLiteralEnd, i)) hasContinuation = true;
+      literals.push(sql.slice(i, stop));
+      lastLiteralEnd = stop;
+      i = stop;
+      continue;
+    }
+
+    // Single-quoted, including the E'' and U&'' prefixes.
+    const prefix = /^(?:[EeNn]|[Uu]&)?'/.exec(sql.slice(i));
+    if (prefix) {
+      const escapeString = /^[Ee]/.test(prefix[0]);
+      const startLit = i;
+      i += prefix[0].length;
+      while (i < n) {
+        if (escapeString && sql[i] === "\\") { i += 2; continue; }
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") { i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      if (gapIsContinuation(lastLiteralEnd, startLit)) hasContinuation = true;
+      literals.push(sql.slice(startLit, i));
+      lastLiteralEnd = i;
+      continue;
+    }
+
+    i++;
+  }
+
+  return { literals, hasContinuation };
 }
+
 function runSql(files) {
   if (files.length === 0) return;
   const mod = tryRequire("sql-formatter");
@@ -218,7 +311,8 @@ function runSql(files) {
     if (out === src) continue;
 
     // Gate 1: never touch a file using string-literal continuation.
-    if (SQL_LITERAL_CONTINUATION.test(src)) {
+    const scanned = scanSql(src);
+    if (scanned.hasContinuation) {
       refused.push(
         `refusing to format ${rel}: it contains a string literal continued across ` +
           `a newline. Joining those lines changes the parse (adjacent literals ` +
@@ -230,8 +324,8 @@ function runSql(files) {
     }
 
     // Gate 2: literal contents are data — they must be untouched.
-    const a = sqlLiterals(src);
-    const b = sqlLiterals(out);
+    const a = scanned.literals;
+    const b = scanSql(out).literals;
     if (a.length !== b.length || a.some((lit, i) => lit !== b[i])) {
       refused.push(
         `refusing to rewrite ${rel}: the formatter altered a string literal. ` +
