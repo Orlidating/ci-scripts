@@ -159,11 +159,39 @@ async function runPrettier(files) {
 // --- SQL ---------------------------------------------------------------------
 /**
  * Formatting a migration rewrites a file that may already have been applied
- * somewhere, so this refuses to write anything that is not a pure whitespace
- * change. Verified against the real harness: the non-whitespace character
- * stream is byte-identical and the transform is idempotent. This guard means a
- * formatter bug degrades to a refusal instead of a corrupted migration.
+ * somewhere, so the bar for writing one is high.
+ *
+ * "Whitespace-only" is NOT a safe premise in SQL, and an earlier version of this
+ * guard was wrong about that. Two string literals separated by a NEWLINE
+ * concatenate — `select 'foo'\n'bar'` is `foobar` — while the same two literals
+ * separated by a SPACE are a syntax error. Collapsing that newline is a
+ * whitespace-only edit by any character-level comparison, and it broke a real
+ * migration that had applied cleanly minutes earlier.
+ *
+ * So there are three gates, and all three must pass:
+ *   1. no string-literal continuation anywhere in the file (we refuse rather
+ *      than reason about it);
+ *   2. the sequence of literal contents is byte-identical, since whitespace
+ *      inside a literal is data, not layout;
+ *   3. the non-whitespace character stream is unchanged.
+ *
+ * A formatter bug, or a construct we have not thought about, therefore degrades
+ * to a refusal instead of a corrupted migration.
  */
+/** `'a'` followed by whitespace containing a newline followed by `'b'`. */
+const SQL_LITERAL_CONTINUATION = /'(?:[^']|'')*'[^\S\n]*\n\s*'/;
+
+/**
+ * Literal contents in order: single-quoted (with '' escapes) and dollar-quoted.
+ * Whitespace inside these is data, so it must survive formatting untouched.
+ */
+function sqlLiterals(sql) {
+  const out = [];
+  const re = /\$([A-Za-z_][A-Za-z0-9_]*)?\$[\s\S]*?\$\1?\$|'(?:[^']|'')*'/g;
+  let m;
+  while ((m = re.exec(sql)) !== null) out.push(m[0]);
+  return out;
+}
 function runSql(files) {
   if (files.length === 0) return;
   const mod = tryRequire("sql-formatter");
@@ -189,6 +217,30 @@ function runSql(files) {
     if (!out.endsWith("\n")) out += "\n";
     if (out === src) continue;
 
+    // Gate 1: never touch a file using string-literal continuation.
+    if (SQL_LITERAL_CONTINUATION.test(src)) {
+      refused.push(
+        `refusing to format ${rel}: it contains a string literal continued across ` +
+          `a newline. Joining those lines changes the parse (adjacent literals ` +
+          `concatenate across a newline, but are a syntax error on one line), and ` +
+          `no character-level check can tell that apart from reflowing. ` +
+          `Format this file by hand, or put the string on one line.`,
+      );
+      continue;
+    }
+
+    // Gate 2: literal contents are data — they must be untouched.
+    const a = sqlLiterals(src);
+    const b = sqlLiterals(out);
+    if (a.length !== b.length || a.some((lit, i) => lit !== b[i])) {
+      refused.push(
+        `refusing to rewrite ${rel}: the formatter altered a string literal. ` +
+          `Whitespace inside a literal is data. Report this — it is a formatter bug.`,
+      );
+      continue;
+    }
+
+    // Gate 3: nothing but layout changed elsewhere.
     const strip = (s) => s.replace(/\s+/g, "");
     if (strip(out) !== strip(src)) {
       refused.push(
