@@ -1,0 +1,31 @@
+{
+  "name": "@orlidating/ci-scripts",
+  "version": "1.0.0",
+  "description": "Repo-agnostic CI checks: GitHub Action SHA pinning, and multi-tool staged-file formatting",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Orlidating/ci-scripts.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "check-action-pins": "bin/check-action-pins.mjs",
+    "format-staged": "bin/format-staged.mjs"
+  },
+  "files": [
+    "bin"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "keywords": [
+    "github-actions",
+    "supply-chain",
+    "sha-pinning",
+    "formatting",
+    "pre-commit"
+  ]
+}
