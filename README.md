@@ -53,8 +53,24 @@ comment, so the pin stays reviewable by a human and Renovate can still track it:
 uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 ```
 
-Checks `.github/workflows/*.y(a)ml` and any composite action under
-`.github/actions/*/action.y(a)ml`.
+Checks `.github/workflows/*.y(a)ml`, every composite action under
+`.github/actions/**/action.y(a)ml`, and every local action or reusable workflow a
+reference names, wherever it lives in the tree (followed recursively, with a depth
+bound and cycle detection).
+
+**It parses, it does not pattern-match.** Every file is read with
+[`yaml`](https://eemeli.org/yaml/), pinned exactly, called as GitHub's own workflow
+parser (`@actions/workflow-parser`) calls it: `parseDocument(…, { uniqueKeys: false })`.
+It walks `jobs.<id>.uses`, `jobs.<id>.steps[*].uses`, `runs.steps[*].uses` and
+`runs.image`, with keys matched case-insensitively, aliases resolved, a duplicated key
+contributing every value and a `<<` merge key contributing what it merges. So flow
+style, quoted, escaped or explicit keys, anchors, tags and next-line values are all
+graded. A file that is not valid YAML, a symlink on a path it reads, or a local
+reference that is not in the tree is a failure, never a skip.
+
+`--root <dir>` checks a directory without git (it prints `check-action-pins: protocol 2`
+first, so a caller can tell it is not an older copy that would ignore `--root`).
+Unknown arguments are an error.
 
 | Reference | Result |
 |---|---|
@@ -63,7 +79,10 @@ Checks `.github/workflows/*.y(a)ml` and any composite action under
 | Tag or branch (`@v5`, `@main`) | **fail** — mutable |
 | Short SHA | **fail** — not guaranteed unique |
 | No ref at all | **fail** — silently tracks the default branch |
-| `./.github/actions/...` | pass — no third party can move it |
+| `./path/to/dir` or `$/path` (local action) | pass — no third party can move it — **and followed**: its `action.yml`/`action.yaml` is graded too |
+| Local action that is not in the tree, or reached through a symlink | **fail** — GitHub would fail, and nothing was checked |
+| `./.github/workflows/x.yml` (local reusable workflow) | followed and graded |
+| A workflow or action that is not valid YAML (several documents included) | **fail** — GitHub would not run it |
 | `docker://img@sha256:...` | pass |
 | `docker://img:tag` | **fail** |
 

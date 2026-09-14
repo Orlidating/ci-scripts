@@ -165,6 +165,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      yaml:
+        specifier: 2.9.0
+        version: 2.9.0
     devDependencies:
       '@biomejs/biome':
         specifier: 2.3.4
@@ -271,6 +275,11 @@ packages:
     resolution: {integrity: sha512-kTYRg5FIcvsDtYUG2Qn9pYT6xKwiLJN5TTIvc5Mur6hIg4pSfdpHu8Yyu5bqESLHnVM3mXzD446cb2+uEaKZXg==}
     hasBin: true
 
+  yaml@2.9.0:
+    resolution: {integrity: sha512-2AvhNX3mb8zd6Zy7INTtSpl1F15HW6Wnqj0srWlkKLcpYl/gMIMJiyuGq2KeI2YFxUPjdlB+3Lc10seMLtL4cA==}
+    engines: {node: '>= 14.6'}
+    hasBin: true
+
 snapshots:
 
   '@biomejs/biome@2.3.4':
@@ -338,3 +347,5 @@ snapshots:
     dependencies:
       argparse: 2.0.1
       nearley: 2.20.1
+
+  yaml@2.9.0: {}

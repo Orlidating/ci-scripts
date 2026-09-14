@@ -29,6 +29,9 @@
     "formatting",
     "pre-commit"
   ],
+  "dependencies": {
+    "yaml": "2.9.0"
+  },
   "devDependencies": {
     "@biomejs/biome": "2.3.4",
     "prettier": "3.9.6",
