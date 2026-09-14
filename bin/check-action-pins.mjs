@@ -360,47 +360,131 @@ function localTarget(rel, lineNo, ref, rest, form, depth) {
   listed.push({ rel, lineNo, ref, state: "local, followed" });
 }
 
+// ---------------------------------------------------------------------------
+// The grammar of a `uses` value (backend#268)
+// ---------------------------------------------------------------------------
+// A reference is PARSED against GitHub's documented forms, never searched for a
+// SHA. The earlier split took the text after the LAST `@`, so
+// `o/r/.github/workflows/y.yml@main@<40 hex>` read as SHA-pinned, while every
+// parser GitHub publishes reads a mutable ref there:
+//   - @actions/workflow-parser src/workflows/file-reference.ts parseFileReference:
+//     `const [remotePath, version] = ref.split("@")` — the ref is "main";
+//   - github/actions-lockfile go/pkg/lockfile/uses.go splitUsesRef:
+//     `strings.SplitN(uses, "@", 2)` — the ref is the branch "main@<sha>";
+//   - actions/runner PipelineTemplateConverter.cs (steps): `Split('@')`, and an
+//     error unless there are exactly two segments.
+// Where they disagree the stricter reading wins, so exactly one `@` is allowed.
+//
+// The forms (docs.github.com, "Workflow syntax for GitHub Actions", jobs.<id>.uses
+// and jobs.<id>.steps[*].uses; "Metadata syntax" for $/):
+//   step   {owner}/{repo}@{ref}   {owner}/{repo}/{path}@{ref}   ./path   $/path
+//          docker://{image}:{tag}   docker://{host}/{image}:{tag}
+//   job    {owner}/{repo}/.github/workflows/{filename}@{ref}   ./.github/workflows/{filename}
+//   image  (action metadata runs.image) docker://…
+// What passes: {ref} is exactly 40 lowercase hex and the whole remainder after
+// the one `@`; a local path; a docker reference whose digest is sha256:<64
+// lowercase hex> (distribution/reference: reference := name [":" tag] ["@" digest],
+// so a tag beside the digest is allowed — the digest alone names the content).
+// Everything else fails closed, including a form this grammar does not know.
+const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/; // GitHub user and organisation names
+const SEGMENT = /^[A-Za-z0-9._-]+$/; // repository names and path segments
+const DOCKER_NAME = /^(?:[A-Za-z0-9.-]+(?::[0-9]+)?\/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$/;
+const DOCKER_TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+const DOCKER_DIGEST = /^sha256:[0-9a-f]{64}$/;
+
+/**
+ * { kind: "docker" | "local" | "self" | "remote", … } or { error, fix }.
+ * Checks that apply to every form come first, so no form can carry them.
+ */
+export function parseUses(ref, form) {
+  if (ref === "") return { error: "reference is empty", fix: "write owner/repo@<sha> # vX.Y.Z" };
+  if (ref.includes("${{")) return { error: "reference is an expression, so what it resolves to is not in the file", fix: "write a literal owner/repo@<sha> # vX.Y.Z" };
+  // \s covers tab, newline and Unicode spaces; Cc and Cf cover other controls and
+  // zero-width characters that would render invisibly in review.
+  if (/[\s\p{Cc}\p{Cf}]/u.test(ref)) return { error: "reference contains whitespace or an invisible or control character", fix: "remove it" };
+  if (ref.includes("%")) return { error: "reference contains a URL-encoded character (%), which no documented form has", fix: "write the characters themselves" };
+  if (ref.includes("\\")) return { error: "reference contains a backslash, which parsers split on differently", fix: "use forward slashes" };
+  if (/^docker:/i.test(ref) && !ref.startsWith("docker://")) {
+    // actions/runner matches "docker://" case-sensitively (Ordinal); anything else is a different form.
+    return { error: "docker reference is not spelled exactly docker://", fix: "write docker://image@sha256:<digest>" };
+  }
+  if (form === "image" && !ref.startsWith("docker://")) return { error: "runs.image is not a docker:// reference", fix: "write docker://image@sha256:<digest>" };
+
+  if (ref.startsWith("docker://")) {
+    const image = ref.slice("docker://".length);
+    const parts = image.split("@");
+    if (parts.length > 2) return { error: "docker reference has more than one @, so its digest is ambiguous", fix: "write docker://image@sha256:<digest>" };
+    if (parts.length < 2) return { error: "docker image referenced by tag, not digest", fix: "pin to docker://image@sha256:<digest>" };
+    const [nameTag, digest] = parts;
+    if (!DOCKER_DIGEST.test(digest)) return { error: `docker digest "${digest}" is not sha256:<64 lowercase hex>`, fix: "pin to docker://image@sha256:<digest>" };
+    // A tag's colon follows the last slash; a colon before it is a registry port.
+    const slash = nameTag.lastIndexOf("/");
+    const colon = nameTag.lastIndexOf(":");
+    const name = colon > slash ? nameTag.slice(0, colon) : nameTag;
+    const tag = colon > slash ? nameTag.slice(colon + 1) : null;
+    if (!DOCKER_NAME.test(name) || (tag !== null && !DOCKER_TAG.test(tag))) {
+      return { error: "docker image name does not match the image reference grammar", fix: "write docker://[host/]image[:tag]@sha256:<digest>" };
+    }
+    return { kind: "docker" };
+  }
+
+  if (ref.startsWith("./") || ref.startsWith("$/")) {
+    // No documented local form has an @ref; `./x@v1` would be a directory named
+    // "x@v1" to the runner and a ref to a reader.
+    if (ref.includes("@")) return { error: `a ${ref.slice(0, 2)} local reference must not contain @`, fix: "drop the @ref; a local reference runs this commit" };
+    return { kind: ref.startsWith("./") ? "local" : "self", rest: ref.slice(2) };
+  }
+
+  const pieces = ref.split("@");
+  if (pieces.length === 1) return { error: "no ref at all — resolves to the default branch", fix: "pin to a full 40-character commit SHA" };
+  if (pieces.length > 2) {
+    return {
+      error: `has ${pieces.length - 1} @ separators; GitHub's parsers read the ref as "${pieces[1]}" (first @) or "${pieces.slice(1).join("@")}" (the rest), both mutable`,
+      fix: "write exactly one @ followed by a full 40-character commit SHA",
+    };
+  }
+  const [remotePath, version] = pieces;
+  const segs = remotePath.split("/");
+  if (segs.some((s) => s === "")) return { error: "owner, repository or path has an empty segment", fix: "write owner/repo[/path]@<sha>" };
+  if (segs.length < 2) return { error: "no owner/repository before the @", fix: "write owner/repo[/path]@<sha>" };
+  const [owner, repo, ...path] = segs;
+  if (!OWNER.test(owner)) return { error: `owner "${owner}" is not a GitHub account name`, fix: "write owner/repo[/path]@<sha>" };
+  if (!SEGMENT.test(repo) || repo === "." || repo === "..") return { error: `repository "${repo}" is not a repository name`, fix: "write owner/repo[/path]@<sha>" };
+  for (const p of path) {
+    if (p === "." || p === "..") return { error: "a remote path has a . or .. segment", fix: "write the path without . or .. segments" };
+    if (!SEGMENT.test(p)) return { error: `path segment "${p}" has a character no action path uses`, fix: "write owner/repo[/path]@<sha>" };
+  }
+  const isWorkflow = path.length === 3 && path[0] === ".github" && path[1] === "workflows" && /\.ya?ml$/.test(path[2]);
+  if (form === "job" && !isWorkflow) {
+    return { error: "a job-level uses must name a reusable workflow, owner/repo/.github/workflows/<file>.y[a]ml@<sha>", fix: "fix the path" };
+  }
+  if (version === "") return { error: "the ref after @ is empty", fix: "pin to a full 40-character commit SHA" };
+  if (!SHA40.test(version)) {
+    return {
+      error: `pinned to the mutable ref "${version}" — the owner can move it at any time`,
+      fix: `pin to a full 40-character commit SHA, e.g.\n      uses: ${remotePath}@<sha> # ${version}\n    resolve it with: gh api repos/${owner}/${repo}/commits/${version} --jq .sha`,
+    };
+  }
+  return { kind: "remote", name: remotePath, version };
+}
+
 function grade(rel, depth, { form, lineNo, value, comment }) {
   if (typeof value !== "string") {
     fail(rel, lineNo, String(value), "uses is not a string, so GitHub's reading of it is unknown", "write the reference as a plain string");
     return;
   }
   const ref = value;
-  if (ref === "" || /\s/.test(ref) || ref.includes("${{")) {
-    fail(rel, lineNo, ref, "reference is empty, has whitespace or an expression", "write owner/repo@<sha> # vX.Y.Z");
+  const parsed = parseUses(ref, form);
+  if (parsed.error) {
+    fail(rel, lineNo, ref, parsed.error, parsed.fix);
     return;
   }
-  if (form === "image" || /^docker:\/\//i.test(ref)) {
-    if (DIGEST.test(ref)) listed.push({ rel, lineNo, ref, state: "digest" });
-    else fail(rel, lineNo, ref, "docker image referenced by tag, not digest", "pin to docker://image@sha256:<digest>");
+  if (parsed.kind === "docker") {
+    listed.push({ rel, lineNo, ref, state: "digest" });
     return;
   }
-  if (ref.startsWith("./")) return localTarget(rel, lineNo, ref, ref.slice(2), form, depth);
-  if (ref.startsWith("$/")) {
-    // The same repository at the running commit (GitHub metadata syntax); no @ref allowed.
-    if (ref.includes("@")) {
-      fail(rel, lineNo, ref, "a $/ self-repository reference must not have an @ref", "drop the @ref");
-      return;
-    }
-    return localTarget(rel, lineNo, ref, ref.slice(2), form, depth);
-  }
-  const at = ref.lastIndexOf("@");
-  if (at === -1) {
-    fail(rel, lineNo, ref, "no ref at all — resolves to the default branch", "pin to a full 40-character commit SHA");
-    return;
-  }
-  const name = ref.slice(0, at);
-  const version = ref.slice(at + 1);
-  if (!SHA40.test(version)) {
-    fail(
-      rel,
-      lineNo,
-      ref,
-      `pinned to the mutable ref "${version}" — the owner can move it at any time`,
-      `pin to a full 40-character commit SHA, e.g.\n      uses: ${name}@<sha> # ${version}\n    resolve it with: gh api repos/${name.split("/").slice(0, 2).join("/")}/commits/${version} --jq .sha`,
-    );
-    return;
-  }
+  if (parsed.kind === "local" || parsed.kind === "self") return localTarget(rel, lineNo, ref, parsed.rest, form, depth);
+  const { name, version } = parsed;
   // SHA-pinned, but keep the version legible for humans and Renovate.
   if (!/^v?\d/.test(comment)) {
     fail(rel, lineNo, ref, "SHA-pinned but missing the version comment", `add a trailing comment naming the version, e.g. "# v5.1.0", so the pin stays reviewable and Renovate can track it`);

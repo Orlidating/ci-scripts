@@ -72,9 +72,29 @@ reference that is not in the tree is a failure, never a skip.
 first, so a caller can tell it is not an older copy that would ignore `--root`).
 Unknown arguments are an error.
 
+Each `uses` value is **parsed against GitHub's documented grammar**, not searched
+for a SHA (backend#268):
+
+- step: `{owner}/{repo}@{ref}`, `{owner}/{repo}/{path}@{ref}`, `./path`, `$/path`,
+  `docker://[host/]image[:tag]@sha256:<digest>`
+- job: `{owner}/{repo}/.github/workflows/{file}.y[a]ml@{ref}`, `./.github/workflows/{file}`
+- `runs.image`: `docker://…`
+
+A remote `{ref}` passes only when it is exactly 40 lowercase hex characters and the
+whole remainder after the **single** `@`. GitHub's parsers split a value with two
+`@` differently (`@actions/workflow-parser` takes the text after the first `@` up to
+the second; `github/actions-lockfile` takes everything after the first `@`; the
+runner rejects it), and every one of those readings is mutable, so more than one `@`
+fails. So do an empty owner, repository or ref, whitespace or invisible characters,
+`%` (URL encoding), a backslash, a `.` or `..` segment in a remote path, a job-level
+`uses` that is not a reusable workflow, and any value no form matches.
+
 | Reference | Result |
 |---|---|
 | Full SHA + version comment | pass |
+| `o/r/.github/workflows/y.yml@main@<sha>`, `@<sha>@main`, `docker://i@x@sha256:…` | **fail** — more than one `@`; GitHub reads a mutable ref |
+| Uppercase hex, `refs/tags/<sha>`, `<sha>^{}` | **fail** — not exactly 40 lowercase hex |
+| `%40`, a space, tab or newline, a backslash, `..` in a remote path | **fail** — no documented form has them |
 | Full SHA, no comment | **fail** — unreviewable |
 | Tag or branch (`@v5`, `@main`) | **fail** — mutable |
 | Short SHA | **fail** — not guaranteed unique |
@@ -83,7 +103,7 @@ Unknown arguments are an error.
 | Local action that is not in the tree, or reached through a symlink | **fail** — GitHub would fail, and nothing was checked |
 | `./.github/workflows/x.yml` (local reusable workflow) | followed and graded |
 | A workflow or action that is not valid YAML (several documents included) | **fail** — GitHub would not run it |
-| `docker://img@sha256:...` | pass |
+| `docker://img@sha256:<64 lowercase hex>` (a tag beside the digest is allowed) | pass |
 | `docker://img:tag` | **fail** |
 
 ### It says when it checked nothing
