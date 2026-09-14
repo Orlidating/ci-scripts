@@ -72,9 +72,19 @@ test("rejects no ref at all — that silently tracks the default branch", () => 
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("allows a local action, which no third party can move", () => {
+test("allows a local action, which no third party can move — and follows it", () => {
   const dir = repoWith(wf("./.github/actions/build"));
+  mkdirSync(path.join(dir, ".github", "actions", "build"), { recursive: true });
+  writeFileSync(path.join(dir, ".github", "actions", "build", "action.yml"), "runs:\n  using: composite\n  steps:\n    - run: echo build\n      shell: bash\n");
   assert.equal(run(dir).code, 0);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a local action that is not in the tree fails (backend#257): GitHub would fail, and nothing was checked", () => {
+  const dir = repoWith(wf("./.github/actions/build"));
+  const { code, out } = run(dir);
+  assert.equal(code, 1);
+  assert.match(out, /no action\.yml or action\.yaml/);
   rmSync(dir, { recursive: true, force: true });
 });
 
