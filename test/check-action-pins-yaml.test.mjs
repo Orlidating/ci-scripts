@@ -14,9 +14,12 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, test } from "node:test";
+import { packageWithLock, pin } from "./lock-package.mjs";
 
-const BIN = path.resolve(import.meta.dirname, "..", "bin", "check-action-pins.mjs");
 const SHA = "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09";
+// These cases grade YAML reading, so the lockfile approves the fixture pins
+// (backend#421 is covered in check-action-pins-lock.test.mjs).
+const BIN = packageWithLock([pin("actions/checkout", "v5.1.0", SHA), pin("actions/cache", "v4.2.0", SHA)]);
 const dirs = [];
 after(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
 
@@ -260,7 +263,7 @@ describe("--root", () => {
   test("prints the protocol line first and needs no git repository", () => {
     const r = spawnSync("node", [BIN, "--root", tree(PINNED_CI)], { cwd: tmpdir(), encoding: "utf8", env: { ...process.env, PATH: path.dirname(process.execPath) } });
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(r.stdout.split("\n")[0], "check-action-pins: protocol 2");
+    assert.equal(r.stdout.split("\n")[0], "check-action-pins: protocol 3");
   });
 
   test("unknown arguments are an error, never ignored", () => {

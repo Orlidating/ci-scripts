@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so an upstream tag that moved after review is noticed without a push.
+  schedule:
+    - cron: "23 7 * * 1"
 
 permissions:
   contents: read
@@ -28,6 +31,15 @@ jobs:
       - name: Unit tests
         run: node --test test/
 
-      # Dogfood: this repo's own workflows must satisfy the check it ships.
+      # Dogfood: this repo's own workflows must satisfy the check it ships,
+      # including the reviewed lockfile (offline, as the pre-push hook runs it).
       - name: Action pins
-        run: node bin/check-action-pins.mjs
+        run: node bin/check-action-pins.mjs --require
+
+      # Online (backend#421): every lockfile entry's tag is resolved in the upstream
+      # repository itself, annotated tags dereferenced, and its commit must be the
+      # locked SHA. An API error fails the job; it is never read as a pass.
+      - name: Verify the lockfile against upstream tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node bin/check-action-pins.mjs --verify-lock

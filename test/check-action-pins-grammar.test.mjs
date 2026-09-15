@@ -14,9 +14,18 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, test } from "node:test";
+import { packageWithLock, pin } from "./lock-package.mjs";
 
-const BIN = path.resolve(import.meta.dirname, "..", "bin", "check-action-pins.mjs");
 const SHA = "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09";
+// These cases grade the grammar, so the lockfile approves every fixture pin that
+// the grammar accepts (backend#421 is covered in check-action-pins-lock.test.mjs).
+const BIN = packageWithLock([
+  pin("actions/checkout", "v1.0.0", SHA),
+  pin("actions/checkout", "v5.1.0", SHA),
+  pin("github/codeql-action", "v1.0.0", SHA, { paths: ["init"] }),
+  pin("o/r", "v1.0.0", SHA, { paths: [".github/workflows/y.yml"] }),
+  pin("my-org/my_repo.js", "v1.0.0", SHA, { paths: ["sub-dir"] }),
+]);
 const DIGEST = `sha256:${"a".repeat(64)}`;
 const dirs = [];
 after(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
