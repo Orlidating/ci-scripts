@@ -1,7 +1,7 @@
 {
   "name": "@orlidating/ci-scripts",
   "version": "1.0.0",
-  "description": "Repo-agnostic CI checks: GitHub Action SHA pinning, and multi-tool staged-file formatting",
+  "description": "Repo-agnostic CI checks: GitHub Action SHA pinning against a reviewed lockfile, and multi-tool staged-file formatting",
   "license": "MIT",
   "packageManager": "pnpm@12.4.1",
   "repository": {
@@ -17,7 +17,8 @@
     "format-staged": "bin/format-staged.mjs"
   },
   "files": [
-    "bin"
+    "bin",
+    "action-pins.lock.json"
   ],
   "scripts": {
     "test": "node --test test/"

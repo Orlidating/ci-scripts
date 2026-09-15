@@ -13,7 +13,7 @@ the project's own invariants stay private.
 
 | Command | What it does |
 |---|---|
-| `check-action-pins` | Fails if any GitHub Action is referenced by a mutable ref. |
+| `check-action-pins` | Fails if any GitHub Action is referenced by a mutable ref, or by a SHA that is not the reviewed commit of the tag its comment names. |
 | `format-staged` | Formats staged files, routing by extension across Biome, Prettier and sql-formatter. |
 
 ## Install
@@ -53,6 +53,76 @@ comment, so the pin stays reviewable by a human and Renovate can still track it:
 uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 ```
 
+### A SHA is not provenance: the reviewed lockfile (backend#421)
+
+GitHub resolves `owner/repo@<sha>` for a commit that exists **anywhere in the
+repository's fork network**, under the upstream name. Two real examples:
+
+- `actions/setup-node@a6aa7c983ce5d580d149344767c9e3f34214804c` exists only in the fork
+  `Rchie121/setup-node`;
+- `actions/upload-artifact@be1eaeb04ae4adec5509a6adeccadb47a703d75b` exists only in the fork
+  `oxasploits/upload-artifact`.
+
+Both are well-formed pins that run code upstream never released, with the job's token.
+`commits/<sha>` and `compare/<tag>...<sha>` answer for them too (the compare reports
+"ahead"), so neither is evidence. The one thing a fork cannot create is a tag in the upstream
+repository itself.
+
+So every remote pin must be **one entry of [`action-pins.lock.json`](action-pins.lock.json)**,
+which ships with this package:
+
+- **owner/repo** matches case-insensitively, as GitHub resolves names;
+- **the version comment** must be exactly the entry's tag (`# v5.1.0`, not `# 5.1.0` or
+  `# v5.1.0 latest`), because it is what a reviewer reads;
+- **the SHA** must be exactly the entry's SHA;
+- **a path after owner/repo** (`o/r/sub@…`, or a reusable workflow `o/r/.github/workflows/x.yml@…`)
+  must be listed in that entry's `paths`. A repository holds test fixtures, examples and
+  workflows that were never a released entry point, so reviewing a tag doesn't approve all of them.
+
+The check is offline, so the pre-push hook needs no network. There is no flag or variable to
+point it at another lockfile: a consuming repository cannot approve its own pins. A lockfile
+that is missing, not JSON, has a duplicated key, an unknown field, a malformed value, or a
+reserved name (`__proto__`, `constructor`, `prototype`, backend#422) approves nothing.
+
+```json
+{
+  "repository": "pnpm/action-setup",
+  "tag": "v4.3.0",
+  "sha": "b906affcce14559ad1aafd4ab0e942779e9f58b1",
+  "tag_type": "annotated",
+  "tag_object": "c336a2788d9774dccfdeb4823a5058ccc9f07453",
+  "resolved_at": "2026-09-15T20:24:39Z",
+  "method": "gh api repos/pnpm/action-setup/git/ref/tags/v4.3.0 + gh api repos/pnpm/action-setup/git/tags/c336…; the tag's commit in pnpm/action-setup itself is the sha"
+}
+```
+
+**Adding or bumping an action** is a ci-scripts PR:
+
+```sh
+node bin/check-action-pins.mjs --resolve actions/checkout@v5.1.0      # prints a verified entry
+node bin/check-action-pins.mjs --resolve github/codeql-action/init@v3  # with a path
+```
+
+`--resolve` reads `repos/<o>/<r>` (the name must not redirect, since a renamed repository's old
+name can be re-registered), then `git/ref/tags/<tag>` in that repository, dereferencing annotated
+tags through `git/tags/<sha>`. It records the commit, and checks that any path exists at it.
+Add the printed entry to the lockfile. Then bump `@orlidating/ci-scripts` in the consuming
+repository in the same change that moves its `uses:`.
+
+**`--verify-lock`** repeats that resolution for every entry and requires the tag's commit to
+**be** the entry's SHA, with the same tag type and tag object. It runs in this repository's CI
+on every push, pull request and weekly. Any API error, a missing `gh`, or a non-JSON answer
+fails it; nothing is read as a pass. Tests use recorded responses
+(`test/fixtures/github-api-recorded.json`) through a fake `gh`, and
+`CHECK_ACTION_PINS_LIVE=1 node --test test/check-action-pins-lock.test.mjs` also runs against
+GitHub.
+
+`docker://image@sha256:<digest>` needs no entry: a digest names the content itself.
+
+This proves the code is what upstream released under the tag a human reviewed. It does not
+prove that release is safe, and it does not reach actions that an upstream composite action
+calls in turn.
+
 Checks `.github/workflows/*.y(a)ml`, every composite action under
 `.github/actions/**/action.y(a)ml`, and every local action or reusable workflow a
 reference names, wherever it lives in the tree (followed recursively, with a depth
@@ -68,8 +138,10 @@ style, quoted, escaped or explicit keys, anchors, tags and next-line values are 
 graded. A file that is not valid YAML, a symlink on a path it reads, or a local
 reference that is not in the tree is a failure, never a skip.
 
-`--root <dir>` checks a directory without git (it prints `check-action-pins: protocol 2`
-first, so a caller can tell it is not an older copy that would ignore `--root`).
+`--root <dir>` checks a directory without git (it prints `check-action-pins: protocol 3`
+first, so a caller can tell it is not an older copy that would ignore `--root`; protocol 3 is
+the first that enforces the lockfile, so a caller that requires it cannot be graded by an
+impostor-accepting protocol-2 copy).
 Unknown arguments are an error.
 
 Each `uses` value is **parsed against GitHub's documented grammar**, not searched
@@ -91,7 +163,11 @@ fails. So do an empty owner, repository or ref, whitespace or invisible characte
 
 | Reference | Result |
 |---|---|
-| Full SHA + version comment | pass |
+| Full SHA whose owner/repo, version comment and SHA are one lockfile entry | pass |
+| Full SHA from a fork of the repository (impostor commit), under a reviewed tag's comment | **fail** — not the reviewed commit |
+| An older release's SHA under a newer comment, or the right SHA under a wrong comment | **fail** — SHA and comment must be one entry |
+| An action, or a tag of it, that is not in the lockfile | **fail** — add it with `--resolve` in ci-scripts |
+| `owner/repo/path@sha` or a reusable workflow whose path the entry does not list | **fail** — not a reviewed entry point |
 | `o/r/.github/workflows/y.yml@main@<sha>`, `@<sha>@main`, `docker://i@x@sha256:…` | **fail** — more than one `@`; GitHub reads a mutable ref |
 | Uppercase hex, `refs/tags/<sha>`, `<sha>^{}` | **fail** — not exactly 40 lowercase hex |
 | `%40`, a space, tab or newline, a backslash, `..` in a remote path | **fail** — no documented form has them |
@@ -114,11 +190,9 @@ phrasing reads like a check that ran and passed, which is the failure shape this
 tool exists to eliminate. Pass `--require` to turn that into a failure — worth it
 in a repo that knows it has workflows, so a mis-glob is loud rather than green.
 
-Resolve a SHA with:
-
-```sh
-gh api repos/actions/checkout/commits/v5 --jq .sha
-```
+Resolve a pin with `node bin/check-action-pins.mjs --resolve owner/repo@tag` in this
+repository, not with `gh api repos/<o>/<r>/commits/<ref>`: that endpoint also answers for a
+fork's commit.
 
 ## `format-staged`
 
@@ -167,8 +241,10 @@ node --test test/
 ```
 
 The pin checker's behaviour is pinned by tests, including the cases that matter
-most: a short SHA, a SHA without a comment, a missing ref, a docker tag, and a
-second workflow file. This repo's own CI runs `check-action-pins` against itself.
+most: a short SHA, a SHA without a comment, a missing ref, a docker tag, a
+second workflow file, and the two real fork commits above, offline and online.
+This repo's own CI runs `check-action-pins --require` against itself and
+`--verify-lock` against GitHub.
 
 ## License
 

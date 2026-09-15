@@ -44,24 +44,41 @@
  * that passed. So is a symlink on any path this reads, a local reference that
  * does not exist, and local references nested deeper than MAX_DEPTH.
  *
+ * A SHA is not provenance either (backend#421). GitHub resolves owner/repo@<sha>
+ * for a commit that exists only in a FORK of owner/repo, so a well-formed pin can
+ * run code upstream never released. Every remote pin must therefore be one entry
+ * of the reviewed lockfile shipped with this package (action-pins.lock.json; see
+ * action-pins-lock.mjs): owner/repo (case-insensitively), the version comment
+ * (exactly the tag) and the SHA (exactly). A path after owner/repo must be listed
+ * in that entry. This is offline; `--verify-lock` checks the lockfile itself
+ * against the upstream tags, and runs in ci-scripts' own CI.
+ *
  * Usage:
  *   check-action-pins                 # check the git working tree's root
  *   check-action-pins --root <dir>    # check a directory (no git needed); prints
- *                                     # "check-action-pins: protocol 2" first
+ *                                     # "check-action-pins: protocol 3" first
  *   check-action-pins --list          # print every action ref and its state
  *   check-action-pins --require       # also fail when there is nothing to check
+ *   check-action-pins --verify-lock   # ONLINE (gh api): every lockfile entry's tag
+ *                                     # must resolve upstream to exactly its SHA
+ *   check-action-pins --resolve owner/repo[/path]@tag
+ *                                     # ONLINE: print a verified lockfile entry
  *
+ * The default mode never touches the network.
  * Exit: 0 all pinned (or nothing to check), 1 violations, 2 bad usage.
  */
 import { execFileSync } from "node:child_process";
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { isAlias, isMap, isScalar, isSeq, LineCounter, parseDocument } from "yaml";
+import { checkPin, LOCK_NAME, LOCK_PATH, loadLock, parseSpec, resolvePin, verifyPin } from "./action-pins-lock.mjs";
 
 // Callers that must not be graded by an older copy of this tool (the orlidating
 // pre-push hook) require this exact line. A version that ignored --root would
-// otherwise grade whatever directory it ran in and could exit 0.
-export const PROTOCOL = "check-action-pins: protocol 2";
+// otherwise grade whatever directory it ran in and could exit 0. Protocol 3 adds
+// the reviewed lockfile (backend#421): a caller that requires it knows an
+// impostor-accepting protocol-2 copy is not grading its push.
+export const PROTOCOL = "check-action-pins: protocol 3";
 
 const MAX_DEPTH = 16; // local actions using local actions, and directory nesting
 const MAX_BYTES = 1024 * 1024;
@@ -72,11 +89,15 @@ const DIGEST = /@sha256:[0-9a-f]{64}$/;
 function usage(msg) {
   console.error(`check-action-pins: ${msg}`);
   console.error("usage: check-action-pins [--root <dir>] [--list] [--require]");
+  console.error("       check-action-pins --verify-lock");
+  console.error("       check-action-pins --resolve owner/repo[/path]@tag");
   process.exit(2);
 }
 
 let LIST = false;
 let REQUIRE = false;
+let VERIFY = false;
+let RESOLVE = null;
 let rootArg = null;
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i++) {
@@ -85,10 +106,84 @@ for (let i = 0; i < argv.length; i++) {
   // A check that reports success without checking anything is the failure shape
   // this tool exists to eliminate. --require turns "nothing found" into a failure.
   else if (a === "--require") REQUIRE = true;
-  else if (a === "--root") {
+  else if (a === "--verify-lock") VERIFY = true;
+  else if (a === "--resolve") {
+    if (i + 1 >= argv.length) usage("--resolve needs owner/repo[/path]@tag");
+    RESOLVE = argv[++i];
+  } else if (a === "--root") {
     if (i + 1 >= argv.length) usage("--root needs a directory");
     rootArg = argv[++i];
   } else usage(`unknown argument ${JSON.stringify(a)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Online modes: the lockfile against the upstream repositories (backend#421)
+// ---------------------------------------------------------------------------
+function ghApi(endpoint) {
+  let out;
+  try {
+    out = execFileSync("gh", ["api", "-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2022-11-28", endpoint], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 60_000,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+  } catch (err) {
+    throw new Error(`${err.stderr ?? ""}`.trim().split("\n")[0] || err.code || err.message);
+  }
+  try {
+    return JSON.parse(out);
+  } catch {
+    throw new Error("the response is not JSON");
+  }
+}
+
+function verifyLockMode() {
+  let lock;
+  try {
+    lock = loadLock();
+  } catch (err) {
+    console.error(`✗ ${LOCK_PATH} ${err.message}`);
+    return 1;
+  }
+  if (lock.pins.length === 0) {
+    console.error(`✗ ${LOCK_NAME} has no pins, so nothing was verified.`);
+    return 1;
+  }
+  console.log(`check-action-pins --verify-lock: ${lock.pins.length} pin${lock.pins.length === 1 ? "" : "s"} in ${LOCK_NAME}`);
+  let bad = 0;
+  for (const pin of lock.pins) {
+    const problems = verifyPin(ghApi, pin);
+    if (problems.length === 0) {
+      console.log(`  ✓ ${pin.repository}@${pin.tag}  ${pin.sha}  (${pin.tag_type})`);
+      continue;
+    }
+    bad++;
+    for (const x of problems) console.error(`  ✗ ${x}`);
+  }
+  if (bad > 0) {
+    console.error(`\n${bad} of ${lock.pins.length} lockfile pins do not match their tags upstream. Nothing that pins them is approved; re-resolve with --resolve and review the change.`);
+    return 1;
+  }
+  console.log(`OK — ${lock.pins.length} lockfile pin${lock.pins.length === 1 ? "" : "s"} match their tags in the upstream repositories.`);
+  return 0;
+}
+
+function resolveMode(spec) {
+  if (!parseSpec(spec)) usage(`--resolve needs owner/repo[/path]@tag, got ${JSON.stringify(spec)}`);
+  try {
+    console.log(JSON.stringify(resolvePin(ghApi, spec), null, 2));
+    return 0;
+  } catch (err) {
+    console.error(`✗ ${err.message}`);
+    return 1;
+  }
+}
+
+if (VERIFY || RESOLVE !== null) {
+  if (VERIFY && RESOLVE !== null) usage("--verify-lock and --resolve are separate modes");
+  if (LIST || REQUIRE || rootArg !== null) usage(`${VERIFY ? "--verify-lock" : "--resolve"} reads the lockfile and GitHub, not a tree; it takes no --root, --list or --require`);
+  process.exit(VERIFY ? verifyLockMode() : resolveMode(RESOLVE));
 }
 
 let repoRoot;
@@ -104,6 +199,18 @@ if (rootArg !== null) {
   if (!st.isDirectory()) usage(`--root ${rootArg} is not a directory`);
 } else {
   repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
+}
+
+// Read before anything is graded, and after the protocol line, so a caller still
+// learns which checker refused. A lockfile that cannot be read approves nothing.
+let LOCK;
+try {
+  LOCK = loadLock();
+} catch (err) {
+  console.error(`✗ the reviewed lockfile ${LOCK_PATH} ${err.message}`);
+  console.error("  Without it no remote Action pin can be approved, so nothing counts as checked.");
+  console.error("  fix: reinstall @orlidating/ci-scripts (pnpm install --frozen-lockfile), or repair the lockfile in ci-scripts.");
+  process.exit(1);
 }
 
 const violations = [];
@@ -465,7 +572,7 @@ export function parseUses(ref, form) {
       fix: `pin to a full 40-character commit SHA, e.g.\n      uses: ${remotePath}@<sha> # ${version}\n    resolve it with: gh api repos/${owner}/${repo}/commits/${version} --jq .sha`,
     };
   }
-  return { kind: "remote", name: remotePath, version };
+  return { kind: "remote", name: remotePath, owner, repo, path, version };
 }
 
 function grade(rel, depth, { form, lineNo, value, comment }) {
@@ -485,12 +592,20 @@ function grade(rel, depth, { form, lineNo, value, comment }) {
   }
   if (parsed.kind === "local" || parsed.kind === "self") return localTarget(rel, lineNo, ref, parsed.rest, form, depth);
   const { name, version } = parsed;
-  // SHA-pinned, but keep the version legible for humans and Renovate.
-  if (!/^v?\d/.test(comment)) {
+  // The version comment is what a reviewer reads, and the lockfile's key.
+  if (comment === "") {
     fail(rel, lineNo, ref, "SHA-pinned but missing the version comment", `add a trailing comment naming the version, e.g. "# v5.1.0", so the pin stays reviewable and Renovate can track it`);
     return;
   }
-  listed.push({ rel, lineNo, ref: `${name}@${version.slice(0, 12)}…`, state: `pinned ${comment}` });
+  // A well-formed SHA is not provenance: GitHub resolves a commit from anywhere in
+  // the fork network under the upstream name (backend#421). Only a reviewed
+  // lockfile entry for exactly this owner/repo, tag and SHA approves it.
+  const unreviewed = checkPin(LOCK, { owner: parsed.owner, repo: parsed.repo, path: parsed.path, sha: version, comment });
+  if (unreviewed) {
+    fail(rel, lineNo, ref, unreviewed.error, unreviewed.fix);
+    return;
+  }
+  listed.push({ rel, lineNo, ref: `${name}@${version.slice(0, 12)}…`, state: `pinned ${comment}, reviewed in ${LOCK_NAME}` });
 }
 
 function checkFile({ rel, kind, depth }) {
@@ -563,7 +678,7 @@ if (violations.length === 0) {
     console.log(msg);
     process.exit(0);
   }
-  console.log(`OK — ${n} action reference${n === 1 ? "" : "s"}, all pinned to an immutable ref.`);
+  console.log(`OK — ${n} action reference${n === 1 ? "" : "s"}, all pinned to an immutable ref; every remote pin is the reviewed commit in ${LOCK_NAME}.`);
   process.exit(0);
 }
 
@@ -577,6 +692,7 @@ for (const v of violations) {
 }
 console.error(
   `${violations.length} unpinned or unreadable action reference${violations.length === 1 ? "" : "s"}.\n` +
-    `A tag is not a pin: the owner can move it, so CI would run code nobody reviewed.\n`,
+    `A tag is not a pin: the owner can move it, so CI would run code nobody reviewed.\n` +
+    `A SHA is not provenance: it must be the reviewed commit of the tag its comment names (${LOCK_NAME}).\n`,
 );
 process.exit(1);
