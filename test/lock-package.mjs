@@ -33,7 +33,19 @@ export function pin(repository, tag, sha, extra = {}) {
   return { repository, tag, sha, tag_type: "lightweight", resolved_at: "2026-09-15T00:00:00Z", method: "test fixture", ...extra };
 }
 
-export const lockText = (pins) => `${JSON.stringify({ lockfile_version: 1, pins }, null, 2)}\n`;
+/** A reviewed image entry (backend#426). */
+export function img(image, digest, extra = {}) {
+  return { image, digest, resolved_at: "2026-09-15T00:00:00Z", method: "test fixture", ...extra };
+}
+
+/**
+ * `pins` may be the pins array, or { pins, images } when a fixture needs reviewed images
+ * too — images are what approve docker://, container: and services.<id>.image.
+ */
+export const lockText = (pins) => {
+  const { pins: p = [], images } = Array.isArray(pins) ? { pins } : pins;
+  return `${JSON.stringify({ lockfile_version: 1, pins: p, ...(images ? { images } : {}) }, null, 2)}\n`;
+};
 
 /** A package copy whose lockfile is `lock`: a pins array, raw text, or null for none. Returns its bin path. */
 export function packageWithLock(lock) {

@@ -88,10 +88,14 @@ test("a local action that is not in the tree fails (backend#257): GitHub would f
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("allows a docker digest but rejects a docker tag", () => {
-  const ok = repoWith(wf(`docker://alpine@sha256:${"a".repeat(64)}`));
-  assert.equal(run(ok).code, 0);
-  rmSync(ok, { recursive: true, force: true });
+test("rejects a docker tag, and a digest the shipped lockfile has not reviewed (backend#426)", () => {
+  // The shipped lockfile reviews no image, so a well-formed digest is refused too: a digest
+  // fixes the bytes, it does not show that anyone looked at them.
+  const unreviewed = repoWith(wf(`docker://alpine@sha256:${"a".repeat(64)}`));
+  const digestRun = run(unreviewed);
+  assert.equal(digestRun.code, 1);
+  assert.match(digestRun.out, /is not in the reviewed lockfile/);
+  rmSync(unreviewed, { recursive: true, force: true });
 
   const bad = repoWith(wf("docker://alpine:3.20"));
   const { code, out } = run(bad);

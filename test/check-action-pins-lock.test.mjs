@@ -95,6 +95,7 @@ describe("offline: a pin passes only as a reviewed lockfile entry (backend#421)"
     unknownRepo: /is not in the reviewed lockfile \(action-pins\.lock\.json in @orlidating\/ci-scripts\)/,
     path: /the path "[^"]+" inside .+ is not reviewed/,
     docker: /by tag, not digest/,
+    unreviewedImage: /the image "alpine" is not in the reviewed lockfile/,
     noComment: /missing the version comment/,
   };
   const BLOCK = [
@@ -118,6 +119,8 @@ describe("offline: a pin passes only as a reviewed lockfile entry (backend#421)"
     ["a path suffix with different owner casing", step(`Actions/Checkout/subdir@${CHECKOUT} # v5.1.0`), "path"],
     ["a reusable workflow the entry does not list", job(`actions/checkout/.github/workflows/ci.yml@${CHECKOUT} # v5.1.0`), "path"],
     ["docker:// without a digest", step("docker://alpine:3.20"), "docker"],
+    // backend#426: the shipped lockfile reviews no image, so a well-formed digest is not a pass.
+    ["a docker digest that is not a reviewed image", step(`docker://alpine@${DIGEST}`), "unreviewedImage"],
     ["no version comment", step(`actions/setup-node@${NODE5}`), "noComment"],
   ];
   for (const [col, extra] of [
@@ -138,7 +141,6 @@ describe("offline: a pin passes only as a reviewed lockfile entry (backend#421)"
     ["every shipped entry", { ".github/workflows/x.yml": `${H}    steps:\n${[`actions/checkout@${CHECKOUT} # v5.1.0`, `pnpm/action-setup@${PNPM} # v4.3.0`, `actions/setup-node@${NODE5} # v5.0.0`, `actions/upload-artifact@${UPLOAD} # v7.0.1`, `actions/download-artifact@${DOWNLOAD} # v8.0.1`].map((u) => `      - uses: ${u}\n`).join("")}` }, 5],
     ["owner and repository in other letter cases, as GitHub resolves them", step(`Actions/Checkout@${CHECKOUT} # v5.1.0`), 1],
     ["all capitals", step(`ACTIONS/SETUP-NODE@${NODE5} # v5.0.0`), 1],
-    ["a docker digest, which is content-addressed and needs no entry", step(`docker://alpine@${DIGEST}`), 1],
   ];
   for (const [name, files, n] of PASS) {
     test(`control: ${name} passes`, () => {
@@ -161,9 +163,9 @@ describe("offline: a pin passes only as a reviewed lockfile entry (backend#421)"
     assert.deepEqual(gh.calls(), []);
   });
 
-  test("--root still prints the protocol line first, now protocol 3", () => {
+  test("--root still prints the protocol line first, now protocol 4", () => {
     const r = check(tree(step(`actions/setup-node@${IMPOSTOR_NODE} # v5.0.0`)));
-    assert.equal(r.stdout.split("\n")[0], "check-action-pins: protocol 3");
+    assert.equal(r.stdout.split("\n")[0], "check-action-pins: protocol 4");
   });
 });
 
@@ -288,7 +290,7 @@ describe("the lockfile itself fails closed", () => {
       for (const files of [step(`actions/checkout@${CHECKOUT} # v5.1.0`), step("./local"), {}]) {
         const r = check(tree({ ...files, "local/action.yml": "runs: {using: composite, steps: []}\n" }), bin);
         assert.equal(r.code, 1, r.out);
-        assert.equal(r.stdout.split("\n")[0], "check-action-pins: protocol 3");
+        assert.equal(r.stdout.split("\n")[0], "check-action-pins: protocol 4");
         assert.match(r.out, why, r.out);
       }
     });

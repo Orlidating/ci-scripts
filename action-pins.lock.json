@@ -1,6 +1,6 @@
 {
   "lockfile_version": 1,
-  "about": "Reviewed GitHub Action pins (backend#421). check-action-pins approves a remote uses: only when its owner/repo (case-insensitive), version comment (exactly the tag) and SHA (exactly) are one entry here; a path after owner/repo must be listed in paths. A SHA alone is not provenance: GitHub resolves fork-network commits under the upstream name. Add or bump an entry with `node bin/check-action-pins.mjs --resolve owner/repo@tag` in a ci-scripts PR; CI runs --verify-lock, which requires each tag to resolve upstream to exactly its sha.",
+  "about": "Reviewed GitHub Action pins (backend#421) and container images (backend#426). check-action-pins approves a remote uses: only when its owner/repo (case-insensitive), version comment (exactly the tag) and SHA (exactly) are one entry of pins; a path after owner/repo must be listed in paths. A SHA alone is not provenance: GitHub resolves fork-network commits under the upstream name. Add or bump an entry with `node bin/check-action-pins.mjs --resolve owner/repo@tag` in a ci-scripts PR; CI runs --verify-lock, which requires each tag to resolve upstream to exactly its sha. Every image a workflow pulls - docker://, an action's runs.image, a job's container and a service's image - must likewise be one entry of images, matched by name and digest, because a digest proves only that the bytes cannot change, not that they were reviewed or came from where you think. images is empty because no workflow in these repositories runs a container image today; add one in a ci-scripts PR, recording in method how the digest was obtained.",
   "pins": [
     {
       "repository": "actions/checkout",
@@ -43,5 +43,6 @@
       "resolved_at": "2026-09-15T20:24:39Z",
       "method": "gh api repos/pnpm/action-setup/git/ref/tags/v4.3.0 + gh api repos/pnpm/action-setup/git/tags/c336a2788d9774dccfdeb4823a5058ccc9f07453; the tag's commit in pnpm/action-setup itself is the sha"
     }
-  ]
+  ],
+  "images": []
 }
