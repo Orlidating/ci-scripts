@@ -22,6 +22,15 @@
  *   - `--resolve owner/repo[/path]@tag` prints a verified entry, so a bump is a
  *     reviewed diff to this file rather than an edit nobody checked.
  *
+ * Images are locked the same way (backend#426). `docker://…`, an action's runs.image, a
+ * job's container and a service's image all pull an artifact by digest, and a digest proves
+ * only that the bytes cannot change: `docker://evil.example.com/pwn@sha256:<64 hex>` is
+ * well-formed, and so is a stale, vulnerable image under a name the team trusts. So every
+ * image must be one entry of `images`, matched by name and digest, and a tag written beside
+ * the digest must be the entry's tag. There is no --verify-lock for images and none is
+ * needed: a git tag can be re-pointed upstream, which is what --verify-lock catches, but a
+ * manifest digest is content-addressed and cannot be, so a reviewed image cannot drift.
+ *
  * Nothing here decides whether a release is safe to run. It decides that the code
  * a workflow runs is the code upstream released under the tag a human reviewed.
  */
@@ -34,14 +43,27 @@ export const LOCK_PATH = path.join(import.meta.dirname, "..", LOCK_NAME);
 export const LOCKFILE_VERSION = 1;
 
 const SHA40 = /^[0-9a-f]{40}$/;
-const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
+// The same account-name rule the reference grammar uses (backend#276): letters, digits and
+// hyphens anywhere, because accounts whose login ends in a hyphen predate GitHub's rule for
+// new names and are still live (`john-`, `git-`, `a--`). A stricter rule here would make a
+// legitimate action impossible to lock, and so impossible to use, while adding nothing: the
+// tag, its commit and the reviewed SHA are what approve a pin, and `.` stays refused so no
+// owner can be `.` or `..`.
+const OWNER = /^[A-Za-z0-9-]+$/;
 const SEGMENT = /^[A-Za-z0-9._-]+$/;
 const TAG = /^[A-Za-z0-9_][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._+-]*)*$/;
 const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 const WORKFLOW_PATH = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 const MAX_TAG_DEPTH = 8;
-const TOP_KEYS = new Set(["lockfile_version", "about", "pins"]);
+const TOP_KEYS = new Set(["lockfile_version", "about", "pins", "images"]);
 const PIN_KEYS = new Set(["repository", "tag", "sha", "tag_type", "tag_object", "paths", "resolved_at", "method"]);
+const IMAGE_KEYS = new Set(["image", "digest", "tag", "resolved_at", "method"]);
+
+// A container image reference, per distribution/reference: an optional host (with an
+// optional port), then lowercase path components.
+const IMAGE_NAME = /^(?:[A-Za-z0-9.-]+(?::[0-9]+)?\/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$/;
+const IMAGE_TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+const DIGEST = /^sha256:[0-9a-f]{64}$/;
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
@@ -105,6 +127,33 @@ export function validatePin(p, where) {
 }
 
 /**
+ * One reviewed image, checked field by field; returns it or throws (backend#426).
+ *
+ * An image entry is name + digest, not name + tag: the digest is what the runner pulls, and
+ * unlike a git tag it cannot be moved, so the entry cannot drift after review. `tag` is
+ * recorded only as the label a reviewer reads, and a reference that writes a tag must write
+ * that one.
+ */
+export function validateImage(x, where) {
+  if (!isObj(x)) throw new Error(`${where} is not an object`);
+  onlyKeys(x, IMAGE_KEYS, where);
+  for (const k of ["image", "tag"]) {
+    if (typeof x[k] === "string" && reservedPart(x[k])) throw new Error(`${where}.${k} uses a reserved name (__proto__, constructor or prototype)`);
+  }
+  if (typeof x.image !== "string" || !IMAGE_NAME.test(x.image)) throw new Error(`${where}.image is not an image name like postgres or ghcr.io/owner/tool`);
+  // The name carries neither the digest nor the tag; those are their own fields. (A colon
+  // may still appear in a host:port, which IMAGE_NAME allows.)
+  if (x.image.includes("@")) throw new Error(`${where}.image must be the name alone, with the digest in "digest"`);
+  if (typeof x.digest !== "string" || !DIGEST.test(x.digest)) throw new Error(`${where}.digest is not sha256:<64 lowercase hex>`);
+  if (Object.hasOwn(x, "tag") && (typeof x.tag !== "string" || !IMAGE_TAG.test(x.tag))) throw new Error(`${where}.tag is not an image tag`);
+  if (typeof x.resolved_at !== "string" || !STAMP.test(x.resolved_at) || Number.isNaN(Date.parse(x.resolved_at))) {
+    throw new Error(`${where}.resolved_at is not a UTC timestamp like 2026-09-15T12:00:00Z`);
+  }
+  if (typeof x.method !== "string" || x.method.trim() === "") throw new Error(`${where}.method is empty`);
+  return x;
+}
+
+/**
  * Parse and validate the lockfile text. Throws on anything short of a clean file:
  * a lockfile this cannot read is not a lockfile that approved anything.
  */
@@ -141,7 +190,20 @@ export function parseLock(text) {
     same.push(pin);
     index.set(key, same);
   });
-  return { pins: data.pins, index };
+
+  // Images are optional: a lockfile with no `images` key approves no image, which is the
+  // right default for a repository that runs none.
+  const rawImages = Object.hasOwn(data, "images") ? data.images : [];
+  if (!Array.isArray(rawImages)) throw new Error("has an images field that is not a list");
+  const imageIndex = new Map(); // image name -> entries
+  rawImages.forEach((raw, i) => {
+    const im = validateImage(raw, `images[${i}]`);
+    const same = imageIndex.get(im.image) ?? [];
+    if (same.some((o) => o.digest === im.digest)) throw new Error(`images[${i}] repeats ${im.image}@${im.digest}`);
+    same.push(im);
+    imageIndex.set(im.image, same);
+  });
+  return { pins: data.pins, index, images: rawImages, imageIndex };
 }
 
 export function loadLock(file = LOCK_PATH) {
@@ -204,6 +266,46 @@ export function checkPin(lock, { owner, repo, path: segs = [], sha, comment }) {
     return {
       error: `the path "${sub}" inside ${canonical}@${tag} is not reviewed (the entry lists ${byTag.paths ? byTag.paths.join(", ") : "no paths"}); a repository can hold test fixtures, examples and workflows that were never a released entry point`,
       fix: `use ${canonical}@${tag} itself, or add "${sub}" to that entry's paths in a ci-scripts PR (--verify-lock checks it exists at the SHA)`,
+    };
+  }
+  return null;
+}
+
+const IMAGE_HINT = (name, digest) =>
+  `in a ci-scripts PR, add to ${LOCK_NAME}'s images:  {"image": "${name}", "digest": "${digest}", "tag": "<the tag reviewed>", "resolved_at": "<UTC now>", "method": "<how the digest was obtained, e.g. docker buildx imagetools inspect ${name}:<tag>>"}  ; then bump @orlidating/ci-scripts in this repository`;
+
+/**
+ * Offline decision for one image reference (backend#426): `uses: docker://…`, an action's
+ * runs.image, a job's container, or a service's image. Returns null when a reviewed entry
+ * approves it, else { error, fix }.
+ *
+ * A digest proves the bytes cannot change. It does not prove anyone looked at them, and it
+ * says nothing about WHERE they came from: `docker://evil.example.com/pwn@sha256:<64 hex>`
+ * is a perfectly well-formed digest, and so is an old, vulnerable image under a name the
+ * team trusts. That is the same gap a bare 40-hex SHA left for actions, so it gets the same
+ * answer: the name and digest must be one reviewed entry.
+ */
+export function checkImage(lock, { name, tag, digest }) {
+  if (!(lock.imageIndex instanceof Map)) throw new TypeError("lock.imageIndex must be a Map");
+  const entries = reservedPart(name) ? [] : (lock.imageIndex.get(name) ?? []);
+  if (entries.length === 0) {
+    return {
+      error: `the image "${name}" is not in the reviewed lockfile (${LOCK_NAME} in @orlidating/ci-scripts); a digest shows the bytes cannot change, not that anyone reviewed them or that they came from where you think`,
+      fix: IMAGE_HINT(name, digest),
+    };
+  }
+  const byDigest = entries.find((e) => e.digest === digest);
+  if (!byDigest) {
+    return {
+      error: `${digest} is not a reviewed digest of "${name}" (reviewed: ${entries.map((e) => `${e.digest}${e.tag ? ` (${e.tag})` : ""}`).join(", ")}); it is an older image under a reviewed name, or an image from somewhere else entirely`,
+      fix: IMAGE_HINT(name, digest),
+    };
+  }
+  // A tag beside the digest is what a reviewer reads, so it must be the reviewed one.
+  if (tag !== null && tag !== undefined && byDigest.tag !== tag) {
+    return {
+      error: `the tag ":${tag}" beside the digest is not the reviewed tag for ${name}@${digest}${byDigest.tag ? `, which is ":${byDigest.tag}"` : " (the entry records no tag)"}; the tag is what a reviewer reads, so it must name the reviewed release exactly`,
+      fix: byDigest.tag ? `write ${name}:${byDigest.tag}@${digest}, or drop the tag` : `drop the tag, or record it in the ${LOCK_NAME} entry in a ci-scripts PR`,
     };
   }
   return null;

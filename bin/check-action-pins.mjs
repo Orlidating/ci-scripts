@@ -19,7 +19,12 @@
  *   - local actions (./path/to/dir, or $/path inside a composite action): the
  *     action.yml / action.yaml there is read and its references checked
  *   - reusable workflows in this repository (./.github/workflows/x.yml): read too
- *   - docker digests (docker://image@sha256:<64 hex>)
+ *
+ * Images are NOT exempt (backend#426). A digest fixes the bytes but says nothing about who
+ * published them or whether anyone looked: `docker://evil.example.com/pwn@sha256:<64 hex>`
+ * is a well-formed digest, and so is an old, vulnerable image under a trusted name. That is
+ * the gap a bare 40-hex SHA left for actions, so images get the same answer — every one must
+ * be a reviewed entry of the lockfile's `images`, by name and digest.
  *
  * How references are found (backend#255, backend#256): every file is PARSED with
  * `yaml`, pinned exactly in package.json — the library GitHub's own workflow
@@ -32,9 +37,21 @@
  * spelling behind; the parser is not.
  *
  * What is read, following GitHub's schema, and decided per reference:
- *   workflows  .github/workflows/*.y[a]ml          jobs.<id>.uses, jobs.<id>.steps[*].uses
+ *   workflows  .github/workflows/*.y[a]ml          jobs.<id>.uses, jobs.<id>.steps[*].uses,
+ *                                                  jobs.<id>.container (a string, or .image),
+ *                                                  jobs.<id>.services.<id>.image
  *   actions    .github/actions/** /action.y[a]ml    runs.steps[*].uses, runs.image (docker://)
  *              and every action a local reference names, anywhere in the tree
+ *
+ * A job's container and service images are graded too (backend#266). `container: node:20`,
+ * `container: {image: …}` and `services.<id>.image` each pull a third-party image the runner
+ * then runs the job inside, with the checkout and every secret the job gets — the tj-actions
+ * retag shape applied to an image. Where they can appear is GitHub's schema, not a guess: in
+ * actions/languageservices workflow-v1.0.json, `container` and `services` are properties of
+ * `job-factory` (a normal job) and NOT of `workflow-job` (a job calling a reusable workflow),
+ * no step carries one, and action-v1.0.json has no container or services key at all. So this
+ * applies to workflow files, reusable workflows included (they are workflow files, and are
+ * followed), and not to composite actions.
  * Keys match case-insensitively, a duplicated key contributes every value,
  * aliases are resolved and a `<<` merge key contributes what it merges (GitHub
  * supports anchors but not merge keys; reading both is the superset). A file
@@ -71,14 +88,19 @@ import { execFileSync } from "node:child_process";
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { isAlias, isMap, isScalar, isSeq, LineCounter, parseDocument } from "yaml";
-import { checkPin, LOCK_NAME, LOCK_PATH, loadLock, parseSpec, resolvePin, verifyPin } from "./action-pins-lock.mjs";
+import { checkImage, checkPin, LOCK_NAME, LOCK_PATH, loadLock, parseSpec, resolvePin, verifyPin } from "./action-pins-lock.mjs";
 
 // Callers that must not be graded by an older copy of this tool (the orlidating
 // pre-push hook) require this exact line. A version that ignored --root would
 // otherwise grade whatever directory it ran in and could exit 0. Protocol 3 adds
 // the reviewed lockfile (backend#421): a caller that requires it knows an
 // impostor-accepting protocol-2 copy is not grading its push.
-export const PROTOCOL = "check-action-pins: protocol 3";
+// Protocol 4 (backend#426) extends the reviewed lockfile to IMAGES: every docker://
+// reference, job container and service image must be a reviewed entry, where protocol 3
+// approved any well-formed digest from any registry. A caller that requires 4 knows a
+// protocol-3 copy — which would pass `docker://evil.example.com/pwn@sha256:…` — is not
+// grading its push. Callers match this line exactly, so bumping it is a breaking change.
+export const PROTOCOL = "check-action-pins: protocol 4";
 
 const MAX_DEPTH = 16; // local actions using local actions, and directory nesting
 const MAX_BYTES = 1024 * 1024;
@@ -215,7 +237,9 @@ try {
 
 const violations = [];
 const listed = [];
-const fail = (rel, lineNo, ref, why, fix) => violations.push({ rel, lineNo, ref, why, fix });
+// `what` names the key the reference came from, so a container image is not reported as
+// though someone had written it under uses:.
+const fail = (rel, lineNo, ref, why, fix, what = "uses") => violations.push({ rel, lineNo, ref, why, fix, what });
 
 // ---------------------------------------------------------------------------
 // The tree: every path component is lstat'ed, so a symlink is refused wherever
@@ -348,6 +372,19 @@ function lineOf(lc, node) {
 function referencesIn(doc, lc, rel, kind) {
   const r = makeReader(doc, rel);
   const refs = []; // { entry, form: "step" | "job" | "image" }
+  /**
+   * A container-shaped value (backend#266): `container: node:20` names the image itself,
+   * `container: {image: …}` names it under image:, and a service is the same shape. An
+   * absent or null value pulls nothing; any other shape is one GitHub would not run, so it
+   * fails rather than being skipped.
+   */
+  const containerImage = (entry, what) => {
+    const v = r.resolve(entry.value);
+    if (v === null || (isScalar(v) && v.value === null)) return;
+    if (isScalar(v)) refs.push({ entry, form: "container" });
+    else if (isMap(v)) for (const im of r.get(entry.value, "image")) refs.push({ entry: im, form: "container" });
+    else fail(rel, lineOf(lc, entry.key), "", `${what} is neither an image string nor a mapping, so GitHub's reading of it is unknown`, "write the image as a string, or as a mapping with image:");
+  };
   if (kind === "workflow") {
     for (const jobs of r.get(doc.contents, "jobs")) {
       for (const job of r.entries(jobs.value)) {
@@ -356,6 +393,16 @@ function referencesIn(doc, lc, rel, kind) {
           for (const step of r.items(steps, `jobs.${job.name}.steps`)) {
             for (const u of r.get(step, "uses")) refs.push({ entry: u, form: "step" });
           }
+        }
+        for (const c of r.get(job.value, "container")) containerImage(c, `jobs.${job.name}.container`);
+        for (const services of r.get(job.value, "services")) {
+          const sv = r.resolve(services.value);
+          if (sv === null || (isScalar(sv) && sv.value === null)) continue;
+          if (!isMap(sv)) {
+            fail(rel, lineOf(lc, services.key), "", `jobs.${job.name}.services is not a mapping of service ids, so GitHub's reading of it is unknown`, "write each service under its own id");
+            continue;
+          }
+          for (const svc of r.entries(services.value)) containerImage(svc, `jobs.${job.name}.services.${svc.name}`);
         }
       }
     }
@@ -409,11 +456,18 @@ function jsReferences(doc, kind) {
     return res;
   };
   const steps = (s) => (Array.isArray(s) ? s : []);
+  // A container or service is the image string itself, or a mapping carrying image:.
+  const image = (c, out) => {
+    if (typeof c === "string") out.push(c);
+    else for (const im of vals(c, "image")) if (typeof im === "string") out.push(im);
+  };
   if (kind === "workflow") {
     for (const jobs of vals(js, "jobs")) {
       for (const job of Object.values(obj(jobs) ?? {})) {
         out.push(...vals(job, "uses"));
         for (const s of vals(job, "steps")) for (const step of steps(s)) out.push(...vals(step, "uses"));
+        for (const c of vals(job, "container")) image(c, out);
+        for (const svcs of vals(job, "services")) for (const svc of Object.values(obj(svcs) ?? {})) image(svc, out);
       }
     }
   } else {
@@ -429,7 +483,13 @@ function jsReferences(doc, kind) {
 // Grading one reference
 // ---------------------------------------------------------------------------
 function localTarget(rel, lineNo, ref, rest, form, depth) {
-  const norm = path.posix.normalize(rest.replace(/\/+$/, "") || ".");
+  // `.//x` and `$//x` leave a leading slash once the two-character prefix is dropped. The
+  // runner combines that value with the workspace path, so it still resolves inside the
+  // repository; normalising without stripping the slash makes it look absolute, and the
+  // reference is then refused for leaving a repository it never left (backend#276).
+  const norm = path.posix.normalize(rest.replace(/^\/+/, "").replace(/\/+$/, "") || ".");
+  // isAbsolute cannot trip once the leading slashes are gone. It is kept so that a future
+  // change to the line above fails closed instead of silently escaping the tree.
   if (norm === ".." || norm.startsWith("../") || path.posix.isAbsolute(norm)) {
     fail(rel, lineNo, ref, "local reference leaves the repository", "reference a path inside this repository");
     return;
@@ -493,11 +553,52 @@ function localTarget(rel, lineNo, ref, rest, form, depth) {
 // lowercase hex> (distribution/reference: reference := name [":" tag] ["@" digest],
 // so a tag beside the digest is allowed — the digest alone names the content).
 // Everything else fails closed, including a form this grammar does not know.
-const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/; // GitHub user and organisation names
+// The owner is not the security boundary — the 40-hex ref and the reviewed lockfile are —
+// and an owner rule stricter than GitHub's own parsers only blocks legitimate references
+// (backend#276). GitHub documents that NEW account names cannot start or end with a hyphen
+// or hold two consecutive ones, but accounts from before that rule are still live and still
+// serve actions: `john-` (a User since 2012 with 30 public repositories), `git-` and `a--`
+// all answer on the REST API today. Every published parser accepts them: actions/runner
+// checks only that the owner segment is non-empty, @actions/workflow-parser the same, and
+// github/actions-lockfile's isValidSegment allows [A-Za-z0-9._-]. So: the character set
+// GitHub actually issues (letters, digits, hyphens), hyphens anywhere, and nothing that
+// could make the reference mean something else — no `.` (so `.` and `..` are impossible),
+// `/`, `@`, `%`, `\` or whitespace, each refused above or by this set.
+const OWNER = /^[A-Za-z0-9-]+$/;
 const SEGMENT = /^[A-Za-z0-9._-]+$/; // repository names and path segments
 const DOCKER_NAME = /^(?:[A-Za-z0-9.-]+(?::[0-9]+)?\/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$/;
 const DOCKER_TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 const DOCKER_DIGEST = /^sha256:[0-9a-f]{64}$/;
+
+// The nouns each caller uses in its messages, so one image-reference rule can serve both
+// `uses: docker://…` and a job's container or service image without either reporting the
+// other's key.
+const DOCKER_NOUNS = { ref: "docker reference", image: "docker image", digest: "docker digest", fix: "pin to docker://image@sha256:<digest>", nameFix: "write docker://[host/]image[:tag]@sha256:<digest>" };
+const CONTAINER_NOUNS = { ref: "container image reference", image: "container image", digest: "container image digest", fix: "pin to image@sha256:<digest>", nameFix: "write [host/]image[:tag]@sha256:<digest>" };
+
+/**
+ * The one shape rule for an image reference: it must carry a sha256 digest, which names the
+ * content itself, so no retag can change what runs. Returns { error, fix } for a malformed
+ * reference, or the parsed { name, tag, digest }, which the lockfile check then decides on
+ * (backend#426). distribution/reference is `name [":" tag] ["@" digest]`, so a tag beside
+ * the digest is allowed — the digest still decides what is pulled.
+ */
+function imageProblem(image, N) {
+  const parts = image.split("@");
+  if (parts.length > 2) return { error: `${N.ref} has more than one @, so its digest is ambiguous`, fix: N.fix };
+  if (parts.length < 2) return { error: `${N.image} referenced by tag, not digest`, fix: N.fix };
+  const [nameTag, digest] = parts;
+  if (!DOCKER_DIGEST.test(digest)) return { error: `${N.digest} "${digest}" is not sha256:<64 lowercase hex>`, fix: N.fix };
+  // A tag's colon follows the last slash; a colon before it is a registry port.
+  const slash = nameTag.lastIndexOf("/");
+  const colon = nameTag.lastIndexOf(":");
+  const name = colon > slash ? nameTag.slice(0, colon) : nameTag;
+  const tag = colon > slash ? nameTag.slice(colon + 1) : null;
+  if (!DOCKER_NAME.test(name) || (tag !== null && !DOCKER_TAG.test(tag))) {
+    return { error: `${N.image} name does not match the image reference grammar`, fix: N.nameFix };
+  }
+  return { name, tag, digest };
+}
 
 /**
  * { kind: "docker" | "local" | "self" | "remote", … } or { error, fix }.
@@ -511,6 +612,17 @@ export function parseUses(ref, form) {
   if (/[\s\p{Cc}\p{Cf}]/u.test(ref)) return { error: "reference contains whitespace or an invisible or control character", fix: "remove it" };
   if (ref.includes("%")) return { error: "reference contains a URL-encoded character (%), which no documented form has", fix: "write the characters themselves" };
   if (ref.includes("\\")) return { error: "reference contains a backslash, which parsers split on differently", fix: "use forward slashes" };
+  if (form === "container") {
+    // A job container or service image is a plain image reference, not a uses: value: the
+    // runner takes container.image as written (ConvertToJobContainer sets Image from the
+    // string or the image: key; ContainerInfo hands that string to docker), so a docker://
+    // prefix would become part of the name GitHub tries to pull, not a scheme it strips.
+    if (/^docker:\/\//i.test(ref)) {
+      return { error: "a job container image is written without the docker:// prefix, which GitHub would pull as part of the image name", fix: "write image@sha256:<digest>" };
+    }
+    const parts = imageProblem(ref, CONTAINER_NOUNS);
+    return parts.error ? parts : { kind: "image", ...parts };
+  }
   if (/^docker:/i.test(ref) && !ref.startsWith("docker://")) {
     // actions/runner matches "docker://" case-sensitively (Ordinal); anything else is a different form.
     return { error: "docker reference is not spelled exactly docker://", fix: "write docker://image@sha256:<digest>" };
@@ -518,21 +630,8 @@ export function parseUses(ref, form) {
   if (form === "image" && !ref.startsWith("docker://")) return { error: "runs.image is not a docker:// reference", fix: "write docker://image@sha256:<digest>" };
 
   if (ref.startsWith("docker://")) {
-    const image = ref.slice("docker://".length);
-    const parts = image.split("@");
-    if (parts.length > 2) return { error: "docker reference has more than one @, so its digest is ambiguous", fix: "write docker://image@sha256:<digest>" };
-    if (parts.length < 2) return { error: "docker image referenced by tag, not digest", fix: "pin to docker://image@sha256:<digest>" };
-    const [nameTag, digest] = parts;
-    if (!DOCKER_DIGEST.test(digest)) return { error: `docker digest "${digest}" is not sha256:<64 lowercase hex>`, fix: "pin to docker://image@sha256:<digest>" };
-    // A tag's colon follows the last slash; a colon before it is a registry port.
-    const slash = nameTag.lastIndexOf("/");
-    const colon = nameTag.lastIndexOf(":");
-    const name = colon > slash ? nameTag.slice(0, colon) : nameTag;
-    const tag = colon > slash ? nameTag.slice(colon + 1) : null;
-    if (!DOCKER_NAME.test(name) || (tag !== null && !DOCKER_TAG.test(tag))) {
-      return { error: "docker image name does not match the image reference grammar", fix: "write docker://[host/]image[:tag]@sha256:<digest>" };
-    }
-    return { kind: "docker" };
+    const parts = imageProblem(ref.slice("docker://".length), DOCKER_NOUNS);
+    return parts.error ? parts : { kind: "docker", ...parts };
   }
 
   if (ref.startsWith("./") || ref.startsWith("$/")) {
@@ -550,12 +649,20 @@ export function parseUses(ref, form) {
       fix: "write exactly one @ followed by a full 40-character commit SHA",
     };
   }
-  const [remotePath, version] = pieces;
+  const [rawPath, version] = pieces;
+  // A trailing slash before the @ is not a segment. actions/runner splits the path with
+  // StringSplitOptions.RemoveEmptyEntries and @actions/workflow-parser filters empty
+  // segments, so both read `actions/checkout/@<sha>` as actions/checkout;
+  // github/actions-lockfile refuses it outright. No parser resolves it anywhere else, so it
+  // is the same reference and blocking it is a false block (backend#276). Interior empty
+  // segments stay refused below: they are not a legitimate spelling of anything, and failing
+  // closed on them costs nothing.
+  const remotePath = rawPath.replace(/\/+$/, "");
   const segs = remotePath.split("/");
   if (segs.some((s) => s === "")) return { error: "owner, repository or path has an empty segment", fix: "write owner/repo[/path]@<sha>" };
   if (segs.length < 2) return { error: "no owner/repository before the @", fix: "write owner/repo[/path]@<sha>" };
   const [owner, repo, ...path] = segs;
-  if (!OWNER.test(owner)) return { error: `owner "${owner}" is not a GitHub account name`, fix: "write owner/repo[/path]@<sha>" };
+  if (!OWNER.test(owner)) return { error: `owner "${owner}" has a character this check does not accept (letters, digits and hyphens)`, fix: "write owner/repo[/path]@<sha>" };
   if (!SEGMENT.test(repo) || repo === "." || repo === "..") return { error: `repository "${repo}" is not a repository name`, fix: "write owner/repo[/path]@<sha>" };
   for (const p of path) {
     if (p === "." || p === "..") return { error: "a remote path has a . or .. segment", fix: "write the path without . or .. segments" };
@@ -575,19 +682,30 @@ export function parseUses(ref, form) {
   return { kind: "remote", name: remotePath, owner, repo, path, version };
 }
 
+/** The key a reference was written under, for its messages. */
+const LABELS = { step: "uses", job: "uses", image: "image", container: "image" };
+
 function grade(rel, depth, { form, lineNo, value, comment }) {
+  const label = LABELS[form] ?? "uses";
   if (typeof value !== "string") {
-    fail(rel, lineNo, String(value), "uses is not a string, so GitHub's reading of it is unknown", "write the reference as a plain string");
+    fail(rel, lineNo, String(value), `${label} is not a string, so GitHub's reading of it is unknown`, "write the reference as a plain string", label);
     return;
   }
   const ref = value;
   const parsed = parseUses(ref, form);
   if (parsed.error) {
-    fail(rel, lineNo, ref, parsed.error, parsed.fix);
+    fail(rel, lineNo, ref, parsed.error, parsed.fix, label);
     return;
   }
-  if (parsed.kind === "docker") {
-    listed.push({ rel, lineNo, ref, state: "digest" });
+  // A digest fixes the bytes, but says nothing about who published them or whether anyone
+  // reviewed them, so an image is approved the same way an action pin is (backend#426).
+  if (parsed.kind === "docker" || parsed.kind === "image") {
+    const unreviewed = checkImage(LOCK, parsed);
+    if (unreviewed) {
+      fail(rel, lineNo, ref, unreviewed.error, unreviewed.fix, label);
+      return;
+    }
+    listed.push({ rel, lineNo, ref, state: `digest, reviewed in ${LOCK_NAME}` });
     return;
   }
   if (parsed.kind === "local" || parsed.kind === "self") return localTarget(rel, lineNo, ref, parsed.rest, form, depth);
@@ -685,7 +803,7 @@ if (violations.length === 0) {
 console.error("");
 for (const v of violations) {
   console.error(`✗ ${v.rel}${v.lineNo ? `:${v.lineNo}` : ""}`);
-  if (v.ref) console.error(`    uses: ${v.ref}`);
+  if (v.ref) console.error(`    ${v.what ?? "uses"}: ${v.ref}`);
   console.error(`    ${v.why}`);
   console.error(`    fix: ${v.fix}`);
   console.error("");

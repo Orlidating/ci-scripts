@@ -117,7 +117,31 @@ fails it; nothing is read as a pass. Tests use recorded responses
 `CHECK_ACTION_PINS_LIVE=1 node --test test/check-action-pins-lock.test.mjs` also runs against
 GitHub.
 
-`docker://image@sha256:<digest>` needs no entry: a digest names the content itself.
+### An image needs an entry too (backend#426)
+
+A digest fixes the bytes. It does not say who published them, or whether anyone looked at
+them: `docker://evil.example.com/pwn@sha256:<64 hex>` is a perfectly well-formed digest, and
+so is an old, vulnerable image under a name the team trusts. That is the same gap a bare
+40-hex SHA left for actions, so images get the same answer — every image a workflow pulls
+must be one entry of the lockfile's `images`, matched by **name** and **digest**:
+
+```json
+{
+  "image": "ghcr.io/owner/tool",
+  "digest": "sha256:<64 lowercase hex>",
+  "tag": "v2.1.0",
+  "resolved_at": "2026-09-15T20:24:39Z",
+  "method": "docker buildx imagetools inspect ghcr.io/owner/tool:v2.1.0"
+}
+```
+
+That one rule covers all four places an image is pulled: `uses: docker://…`, an action's
+`runs.image`, `jobs.<id>.container` and `jobs.<id>.services.<id>.image`. A tag written beside
+the digest must be the entry's tag, because the tag is what a reviewer reads.
+
+There is no `--verify-lock` for images, and none is needed: a git tag can be re-pointed
+upstream, which is exactly what `--verify-lock` catches, but a manifest digest is
+content-addressed and cannot be, so a reviewed image entry cannot drift after review.
 
 This proves the code is what upstream released under the tag a human reviewed. It does not
 prove that release is safe, and it does not reach actions that an upstream composite action
@@ -131,17 +155,23 @@ bound and cycle detection).
 **It parses, it does not pattern-match.** Every file is read with
 [`yaml`](https://eemeli.org/yaml/), pinned exactly, called as GitHub's own workflow
 parser (`@actions/workflow-parser`) calls it: `parseDocument(…, { uniqueKeys: false })`.
-It walks `jobs.<id>.uses`, `jobs.<id>.steps[*].uses`, `runs.steps[*].uses` and
+It walks `jobs.<id>.uses`, `jobs.<id>.steps[*].uses`, `jobs.<id>.container` (a string, or
+its `image:`), `jobs.<id>.services.<id>.image`, `runs.steps[*].uses` and
 `runs.image`, with keys matched case-insensitively, aliases resolved, a duplicated key
 contributing every value and a `<<` merge key contributing what it merges. So flow
 style, quoted, escaped or explicit keys, anchors, tags and next-line values are all
 graded. A file that is not valid YAML, a symlink on a path it reads, or a local
 reference that is not in the tree is a failure, never a skip.
 
-`--root <dir>` checks a directory without git (it prints `check-action-pins: protocol 3`
-first, so a caller can tell it is not an older copy that would ignore `--root`; protocol 3 is
-the first that enforces the lockfile, so a caller that requires it cannot be graded by an
-impostor-accepting protocol-2 copy).
+`--root <dir>` checks a directory without git (it prints `check-action-pins: protocol 4`
+first, so a caller can tell it is not an older copy that would ignore `--root`; protocol 3 was
+the first that enforced the lockfile for actions, and protocol 4 extends it to images, so a
+caller that requires 4 cannot be graded by a copy that would approve
+`docker://evil.example.com/pwn@sha256:…` on shape alone).
+
+**Bumping the protocol is a breaking change for callers.** The orlidating pre-push hook
+matches this line exactly, so `@orlidating/ci-scripts` and the hook's expected protocol have
+to move together.
 Unknown arguments are an error.
 
 Each `uses` value is **parsed against GitHub's documented grammar**, not searched
@@ -151,6 +181,9 @@ for a SHA (backend#268):
   `docker://[host/]image[:tag]@sha256:<digest>`
 - job: `{owner}/{repo}/.github/workflows/{file}.y[a]ml@{ref}`, `./.github/workflows/{file}`
 - `runs.image`: `docker://…`
+- job container and service images (`jobs.<id>.container`, `jobs.<id>.container.image`,
+  `jobs.<id>.services.<id>.image`): `[host/]image[:tag]@sha256:<digest>`, written without a
+  `docker://` prefix, which GitHub would pull as part of the name
 
 A remote `{ref}` passes only when it is exactly 40 lowercase hex characters and the
 whole remainder after the **single** `@`. GitHub's parsers split a value with two
@@ -171,6 +204,10 @@ fails. So do an empty owner, repository or ref, whitespace or invisible characte
 | `o/r/.github/workflows/y.yml@main@<sha>`, `@<sha>@main`, `docker://i@x@sha256:…` | **fail** — more than one `@`; GitHub reads a mutable ref |
 | Uppercase hex, `refs/tags/<sha>`, `<sha>^{}` | **fail** — not exactly 40 lowercase hex |
 | `%40`, a space, tab or newline, a backslash, `..` in a remote path | **fail** — no documented form has them |
+| `john-/some-action@<sha> # v1.0.0` (an owner whose login ends in a hyphen) | pass — such accounts exist, and every published parser resolves them |
+| `actions/checkout/@<sha> # v5.1.0` (a trailing slash before the `@`) | pass — the runner and `@actions/workflow-parser` both read it as `actions/checkout` |
+| `.//tools//setup` (doubled slashes in a local path) | pass — it still resolves inside the repository |
+| An owner containing `.`, `_` or any other character GitHub does not issue | **fail** |
 | Full SHA, no comment | **fail** — unreviewable |
 | Tag or branch (`@v5`, `@main`) | **fail** — mutable |
 | Short SHA | **fail** — not guaranteed unique |
@@ -179,8 +216,15 @@ fails. So do an empty owner, repository or ref, whitespace or invisible characte
 | Local action that is not in the tree, or reached through a symlink | **fail** — GitHub would fail, and nothing was checked |
 | `./.github/workflows/x.yml` (local reusable workflow) | followed and graded |
 | A workflow or action that is not valid YAML (several documents included) | **fail** — GitHub would not run it |
-| `docker://img@sha256:<64 lowercase hex>` (a tag beside the digest is allowed) | pass |
+| `docker://img@sha256:<64 lowercase hex>` whose name and digest are one `images` entry | pass |
+| `docker://img@sha256:<64 lowercase hex>` that is not in the lockfile | **fail** — a digest is not a review |
+| `docker://evil.example.com/pwn@sha256:…`, or an older digest under a reviewed name | **fail** — not a reviewed entry |
 | `docker://img:tag` | **fail** |
+| `container: node:20`, `container: {image: node:20}`, `services.db.image: postgres:16` | **fail** — a tag can be moved onto another image |
+| `container: node@sha256:…`, `services.db.image: postgres@sha256:…`, each a reviewed entry | pass |
+| A tag beside a reviewed digest that is not the entry's tag | **fail** — the tag is what a reviewer reads |
+| `container: ${{ matrix.image }}` | **fail** — not gradeable |
+| `container: docker://node@sha256:…` | **fail** — GitHub pulls `docker://node` as the name |
 
 ### It says when it checked nothing
 

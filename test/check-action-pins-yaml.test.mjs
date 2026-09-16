@@ -14,12 +14,15 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, test } from "node:test";
-import { packageWithLock, pin } from "./lock-package.mjs";
+import { img, packageWithLock, pin } from "./lock-package.mjs";
 
 const SHA = "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09";
-// These cases grade YAML reading, so the lockfile approves the fixture pins
-// (backend#421 is covered in check-action-pins-lock.test.mjs).
-const BIN = packageWithLock([pin("actions/checkout", "v5.1.0", SHA), pin("actions/cache", "v4.2.0", SHA)]);
+// These cases grade YAML reading, so the lockfile approves the fixture pins and images
+// (backend#421 and backend#426 are covered in their own files).
+const BIN = packageWithLock({
+  pins: [pin("actions/checkout", "v5.1.0", SHA), pin("actions/cache", "v4.2.0", SHA)],
+  images: [img("alpine", `sha256:${"a".repeat(64)}`)],
+});
 const dirs = [];
 after(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
 
@@ -195,6 +198,23 @@ describe("local actions are followed wherever they live (backend#257)", () => {
     assert.match(r.out, /leaves the repository/);
   });
 
+  test("a local path that escapes behind a leading slash still blocks (backend#276)", () => {
+    // `.//..` normalises to `..` once the leading slash is stripped, so accepting the
+    // doubled slash must not accept the escape with it.
+    for (const ref of [".//../elsewhere", ".//..", "$//../elsewhere"]) {
+      const r = run(tree({ ".github/workflows/x.yml": WF(JSON.stringify(ref)) }));
+      assert.equal(r.code, 1, r.out);
+      assert.match(r.out, /leaves the repository/, ref);
+    }
+  });
+
+  test("a local path with doubled slashes is followed, not refused (backend#276)", () => {
+    const r = run(tree({ ".github/workflows/x.yml": WF(".//tools//setup"), "tools/setup/action.yml": COMPOSITE("actions/cache@v4") }));
+    assert.equal(r.code, 1, r.out);
+    // Blocked for what the action inside it uses, which means it was read.
+    assert.match(r.out, /tools\/setup\/action\.yml[\s\S]*actions\/cache@v4/, r.out);
+  });
+
   test("a local reusable workflow is followed", () => {
     const r = run(tree({ ".github/workflows/x.yml": "on: push\njobs:\n  c:\n    uses: ./.github/workflows/y.yml\n", ".github/workflows/y.yml": "on: workflow_call\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{uses: actions/checkout@v4}]\n" }));
     assert.equal(r.code, 1, r.out);
@@ -263,7 +283,7 @@ describe("--root", () => {
   test("prints the protocol line first and needs no git repository", () => {
     const r = spawnSync("node", [BIN, "--root", tree(PINNED_CI)], { cwd: tmpdir(), encoding: "utf8", env: { ...process.env, PATH: path.dirname(process.execPath) } });
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(r.stdout.split("\n")[0], "check-action-pins: protocol 3");
+    assert.equal(r.stdout.split("\n")[0], "check-action-pins: protocol 4");
   });
 
   test("unknown arguments are an error, never ignored", () => {

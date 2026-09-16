@@ -14,19 +14,24 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, describe, test } from "node:test";
-import { packageWithLock, pin } from "./lock-package.mjs";
+import { img, packageWithLock, pin } from "./lock-package.mjs";
 
 const SHA = "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09";
-// These cases grade the grammar, so the lockfile approves every fixture pin that
-// the grammar accepts (backend#421 is covered in check-action-pins-lock.test.mjs).
-const BIN = packageWithLock([
-  pin("actions/checkout", "v1.0.0", SHA),
-  pin("actions/checkout", "v5.1.0", SHA),
-  pin("github/codeql-action", "v1.0.0", SHA, { paths: ["init"] }),
-  pin("o/r", "v1.0.0", SHA, { paths: [".github/workflows/y.yml"] }),
-  pin("my-org/my_repo.js", "v1.0.0", SHA, { paths: ["sub-dir"] }),
-]);
 const DIGEST = `sha256:${"a".repeat(64)}`;
+// These cases grade the grammar, so the lockfile approves every fixture pin and image that
+// the grammar accepts (backend#421 and backend#426 are covered in their own files).
+const BIN = packageWithLock({
+  pins: [
+    pin("actions/checkout", "v1.0.0", SHA),
+    pin("actions/checkout", "v5.1.0", SHA),
+    pin("github/codeql-action", "v1.0.0", SHA, { paths: ["init"] }),
+    pin("o/r", "v1.0.0", SHA, { paths: [".github/workflows/y.yml"] }),
+    pin("my-org/my_repo.js", "v1.0.0", SHA, { paths: ["sub-dir"] }),
+    // An owner whose login ends in a hyphen: `john-` is a live User account (backend#276).
+    pin("john-/x", "v1.0.0", SHA),
+  ],
+  images: [img("alpine", DIGEST), img("ghcr.io:443/o/img", DIGEST, { tag: "1.2" })],
+});
 const dirs = [];
 after(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
 
@@ -69,7 +74,7 @@ const R = {
   backslash: /backslash/,
   dotdot: /\. or \.\. segment/,
   "form-job": /job-level uses must name a reusable workflow/,
-  "form-owner": /is not a GitHub account name/,
+  "form-owner": /has a character this check does not accept/,
   "form-docker": /not spelled exactly docker:\/\//,
   digest: /is not sha256:<64 lowercase hex>|by tag, not digest/,
   "local-at": /local reference must not contain @/,
@@ -112,6 +117,25 @@ const BLOCK = [
   ["local path with @", step("./tools/setup@v1"), "local-at"],
   ["expression with spaces", step("${{ matrix.action }}"), "expression"],
   ["expression without spaces", step("${{matrix.action}}"), "expression"],
+  // The owner charset stays load-bearing: hyphens are allowed anywhere (backend#276), but
+  // nothing that could make the reference name something else is.
+  ["owner with a dot", step(`john.doe/x@${SHA}`), "form-owner"],
+  ["owner with an underscore", step(`john_doe/x@${SHA}`), "form-owner"],
+  ["owner with a tilde", step(`john~/x@${SHA}`), "form-owner"],
+  // Accepting the owner does not accept the ref: a hyphen-owner still needs a SHA.
+  ["a hyphen-ending owner, tag-pinned", step("john-/x@v1"), "sha40"],
+  ["a hyphen-ending owner, short SHA", step(`john-/x@${SHA.slice(0, 7)}`), "sha40"],
+  // A trailing slash is not a free path segment: the rest of the path still has to parse.
+  ["a trailing slash after a .. path segment", step(`o/r/../other/@${SHA}`), "dotdot"],
+  // Accepting a TRAILING slash must not accept a LEADING one. The runner and
+  // @actions/workflow-parser drop empty segments and would read these as o/r, but
+  // github/actions-lockfile refuses them, and an owner that is not written where an owner
+  // goes has no legitimate spelling — so this stays refused, and that is pinned here
+  // rather than left to the `no owner/repository` rule, which only catches the one-segment
+  // case (mutant M04).
+  ["a leading slash before the owner", step(`/o/r@${SHA}`), "empty"],
+  ["two leading slashes before the owner", step(`//o/r@${SHA}`), "empty"],
+  ["a leading slash with a path", step(`/o/r/sub@${SHA}`), "empty"],
 ];
 
 // Controls: every legitimate form still passes.
@@ -123,6 +147,10 @@ const PASS = [
   ["docker host, port, tag and digest", step(`docker://ghcr.io:443/o/img:1.2@${DIGEST}`)],
   ["docker runs.image digest", image(`docker://alpine@${DIGEST}`)],
   ["dots, dashes and underscores in names", step(`my-org/my_repo.js/sub-dir@${SHA}`)],
+  // backend#276: three references GitHub resolves that this used to refuse.
+  ["an owner whose login ends in a hyphen", step(`john-/x@${SHA}`)],
+  ["a trailing slash before the @", step(`actions/checkout/@${SHA}`)],
+  ["a local path with doubled slashes", { ...step(".//tools//setup"), "tools/setup/action.yml": "runs: {using: composite, steps: []}\n" }],
 ];
 
 describe("uses is parsed against GitHub's grammar (backend#268)", () => {
